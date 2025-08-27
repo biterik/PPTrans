@@ -98,3 +98,7 @@ ssl_fix_*.sh
 user_data/
 translations/
 temp/
+credentials/
+.env
+config.local.*
+*.json

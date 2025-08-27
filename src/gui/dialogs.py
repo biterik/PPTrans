@@ -36,7 +36,7 @@ class SettingsDialog:
             'remember_last_directory': self.config.get('gui.remember_last_directory', True),
             
             # Translation settings
-            'default_source_language': self.config.get('translation.default_source_language', 'auto'),
+            'default_source_language': self.config.get('translation.default_source_language', 'de'),
             'default_target_language': self.config.get('translation.default_target_language', 'en'),
             'chunk_size': self.config.get('translation.chunk_size', 5000),
             'max_retries': self.config.get('translation.max_retries', 3),

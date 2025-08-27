@@ -238,7 +238,7 @@ class PPTransMainWindow(LoggerMixin):
         self.target_lang_combo['values'] = target_names
         
         # Set default values
-        default_source = self.config.get("translation.default_source_language", "auto")
+        default_source = self.config.get("translation.default_source_language", "de")
         default_target = self.config.get("translation.default_target_language", "en")
         
         self._set_language_combo_value(self.source_lang_combo, self.source_lang_var, default_source)

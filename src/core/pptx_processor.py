@@ -282,7 +282,7 @@ class PPTXProcessor(LoggerMixin):
             # Use batch translation
             translated_texts = translator.translate_text_batch(
                 texts_to_translate, 
-                source_lang='auto', 
+                source_lang='de', 
                 target_lang='en'
             )
             
