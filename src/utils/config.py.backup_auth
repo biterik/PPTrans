@@ -1,0 +1,227 @@
+"""
+Configuration management for PPTrans
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
+from .logger import LoggerMixin
+
+class Config(LoggerMixin):
+    """Configuration manager for PPTrans"""
+    
+    DEFAULT_CONFIG = {
+        "app": {
+            "name": "PPTrans",
+            "version": "1.0.0",
+            "author": "PPTrans Team"
+        },
+        "gui": {
+            "window_width": 800,
+            "window_height": 600,
+            "theme": "default",
+            "remember_window_size": True,
+            "remember_last_directory": True
+        },
+        "translation": {
+            "default_source_language": "auto",
+            "default_target_language": "en",
+            "chunk_size": 5000,
+            "max_retries": 3,
+            "retry_delay": 1.0,
+            "timeout": 30
+        },
+        "logging": {
+            "level": "INFO",
+            "console_output": True,
+            "file_output": True,
+            "max_log_files": 10
+        },
+        "advanced": {
+            "preserve_animations": True,
+            "backup_original": True,
+            "parallel_processing": False,
+            "max_workers": 4
+        }
+    }
+    
+    def __init__(self, config_file: Optional[str] = None):
+        """
+        Initialize configuration manager
+        
+        Args:
+            config_file: Path to configuration file
+        """
+        self.config_file = config_file or self._get_default_config_file()
+        self._config = self.DEFAULT_CONFIG.copy()
+        self.load()
+    
+    def _get_default_config_file(self) -> Path:
+        """Get default configuration file path"""
+        if getattr(sys, 'frozen', False):
+            # Running as compiled executable
+            config_dir = Path(sys.executable).parent / "config"
+        else:
+            # Running as script
+            config_dir = Path.home() / ".pptrans"
+        
+        config_dir.mkdir(exist_ok=True)
+        return config_dir / "config.json"
+    
+    def load(self) -> None:
+        """Load configuration from file"""
+        try:
+            if self.config_file.exists():
+                self.logger.info(f"Loading configuration from: {self.config_file}")
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    file_config = json.load(f)
+                
+                # Merge with default config (file config takes precedence)
+                self._merge_config(self._config, file_config)
+                self.logger.info("Configuration loaded successfully")
+            else:
+                self.logger.info("No configuration file found, using defaults")
+                self.save()  # Create default config file
+                
+        except Exception as e:
+            self.logger.error(f"Error loading configuration: {e}")
+            self.logger.warning("Using default configuration")
+    
+    def save(self) -> None:
+        """Save configuration to file"""
+        try:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(self._config, f, indent=4, sort_keys=True)
+            
+            self.logger.info(f"Configuration saved to: {self.config_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving configuration: {e}")
+    
+    def _merge_config(self, target: Dict, source: Dict) -> None:
+        """
+        Recursively merge configuration dictionaries
+        
+        Args:
+            target: Target dictionary to merge into
+            source: Source dictionary to merge from
+        """
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                self._merge_config(target[key], value)
+            else:
+                target[key] = value
+    
+    def get(self, key_path: str, default: Any = None) -> Any:
+        """
+        Get configuration value using dot notation
+        
+        Args:
+            key_path: Dot-separated key path (e.g., "gui.window_width")
+            default: Default value if key not found
+        
+        Returns:
+            Configuration value
+        """
+        try:
+            keys = key_path.split('.')
+            value = self._config
+            
+            for key in keys:
+                value = value[key]
+            
+            return value
+            
+        except (KeyError, TypeError):
+            self.logger.debug(f"Configuration key not found: {key_path}, using default: {default}")
+            return default
+    
+    def set(self, key_path: str, value: Any, save_immediately: bool = True) -> None:
+        """
+        Set configuration value using dot notation
+        
+        Args:
+            key_path: Dot-separated key path (e.g., "gui.window_width")
+            value: Value to set
+            save_immediately: Whether to save to file immediately
+        """
+        try:
+            keys = key_path.split('.')
+            config = self._config
+            
+            # Navigate to the parent dictionary
+            for key in keys[:-1]:
+                if key not in config:
+                    config[key] = {}
+                config = config[key]
+            
+            # Set the value
+            config[keys[-1]] = value
+            
+            if save_immediately:
+                self.save()
+            
+            self.logger.debug(f"Configuration updated: {key_path} = {value}")
+            
+        except Exception as e:
+            self.logger.error(f"Error setting configuration: {e}")
+    
+    def get_all(self) -> Dict[str, Any]:
+        """Get entire configuration dictionary"""
+        return self._config.copy()
+    
+    def reset_to_defaults(self) -> None:
+        """Reset configuration to default values"""
+        self.logger.warning("Resetting configuration to defaults")
+        self._config = self.DEFAULT_CONFIG.copy()
+        self.save()
+    
+    def update(self, updates: Dict[str, Any], save_immediately: bool = True) -> None:
+        """
+        Update multiple configuration values
+        
+        Args:
+            updates: Dictionary of key-value pairs to update
+            save_immediately: Whether to save to file immediately
+        """
+        for key_path, value in updates.items():
+            self.set(key_path, value, save_immediately=False)
+        
+        if save_immediately:
+            self.save()
+    
+    def get_section(self, section: str) -> Dict[str, Any]:
+        """
+        Get an entire configuration section
+        
+        Args:
+            section: Section name (e.g., "gui", "translation")
+        
+        Returns:
+            Section dictionary
+        """
+        return self._config.get(section, {}).copy()
+    
+    # Convenience methods for common configuration values
+    def get_window_size(self) -> tuple:
+        """Get GUI window size"""
+        return (
+            self.get("gui.window_width", 800),
+            self.get("gui.window_height", 600)
+        )
+    
+    def get_translation_settings(self) -> Dict[str, Any]:
+        """Get translation settings"""
+        return self.get_section("translation")
+    
+    def get_logging_level(self) -> str:
+        """Get logging level"""
+        return self.get("logging.level", "INFO")
+    
+    def is_debug_mode(self) -> bool:
+        """Check if debug mode is enabled"""
+        return self.get_logging_level().upper() == "DEBUG"
