@@ -1,7 +1,8 @@
 """
-PPTX Processor with batch translation support
+PPTX Processor with FIXED text distribution - no more text corruption
 """
 import os
+import html  # Add this import for HTML entity decoding
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from pptx import Presentation
@@ -13,7 +14,7 @@ from utils.exceptions import ValidationError, PPTXProcessingError
 
 
 class PPTXProcessor(LoggerMixin):
-    """PowerPoint processor optimized for batch translation"""
+    """PowerPoint processor optimized for batch translation with FIXED text distribution"""
     
     def __init__(self, advanced_settings: dict):
         """Initialize with advanced settings from config"""
@@ -30,7 +31,7 @@ class PPTXProcessor(LoggerMixin):
             'error_count': 0
         }
         
-        self.logger.info("Batch-enabled PPTXProcessor initialized")
+        self.logger.info("FIXED Batch-enabled PPTXProcessor initialized")
         
     def load_presentation(self, file_path: str):
         """Load the PowerPoint presentation"""
@@ -246,6 +247,21 @@ class PPTXProcessor(LoggerMixin):
         
         return self.text_elements
     
+    def _should_skip_translation(self, text: str) -> bool:
+        """Check if text should be skipped from translation (URLs, emails, etc.)"""
+        import re
+        
+        # Skip URLs
+        url_pattern = r'https?://[^\s]+'
+        if re.search(url_pattern, text):
+            return True
+        
+        # Skip if text is mostly a URL
+        if text.strip().startswith(('http://', 'https://', 'www.')):
+            return True
+            
+        return False
+    
     def translate_text_elements(self, translate_callback: Callable[[str], str]) -> None:
         """
         Translate extracted text elements using batch processing
@@ -267,6 +283,12 @@ class PPTXProcessor(LoggerMixin):
         for i, element in enumerate(self.text_elements):
             original_text = element['original_text']
             if original_text and original_text.strip():
+                # Skip URLs and other content that shouldn't be translated
+                if self._should_skip_translation(original_text):
+                    element['translated_text'] = original_text  # Keep original
+                    self.logger.debug(f"Skipped translation for URL/special content: '{original_text[:50]}...'")
+                    continue
+                    
                 texts_to_translate.append(original_text)
                 element_map[len(texts_to_translate) - 1] = i
             else:
@@ -314,87 +336,55 @@ class PPTXProcessor(LoggerMixin):
     
     def _distribute_translation_to_runs(self, element: Dict[str, Any]) -> None:
         """
-        Distribute translated paragraph text back to individual runs
-        This is the tricky part - we need to map the translated text back to the original run structure
+        FIXED: Simple and clean approach - put entire translation in first run, clear others
+        This prevents word fragmentation and text corruption
         """
-        original_text = element['original_text']
         translated_text = element['translated_text']
         runs = element['runs']
         
-        if not translated_text or translated_text == original_text:
-            # No translation occurred, keep original run texts
+        if not translated_text or not runs:
             return
         
-        # Simple approach: if translation is close in length, distribute proportionally
-        # More sophisticated approach would use word alignment
+        # Decode HTML entities first
+        translated_text = html.unescape(translated_text)
         
-        original_length = len(original_text)
-        translated_length = len(translated_text)
-        
-        if original_length == 0:
-            return
-        
-        # Calculate proportional distribution
-        distributed_texts = []
-        current_pos = 0
-        
-        for run_data in runs:
-            run_text = run_data['text']
-            run_length = len(run_text)
+        # Simple approach: Put entire translation in the first run
+        # This preserves readability at the cost of some run-level formatting
+        if runs:
+            # Apply translation to first run
+            runs[0]['translated_text'] = translated_text
             
-            if run_length == 0:
-                distributed_texts.append('')
-                continue
-            
-            # Calculate proportion of translated text for this run
-            proportion = run_length / original_length
-            target_length = int(translated_length * proportion)
-            
-            # Extract portion of translated text
-            if current_pos + target_length <= translated_length:
-                run_translated = translated_text[current_pos:current_pos + target_length]
-                current_pos += target_length
-            else:
-                # Take remaining text for last run
-                run_translated = translated_text[current_pos:]
-                current_pos = translated_length
-            
-            # Handle word boundaries to avoid splitting words
-            if run_translated and current_pos < translated_length:
-                # Try to end at word boundary
-                last_space = run_translated.rfind(' ')
-                if last_space > len(run_translated) * 0.5:  # Only if we're not cutting too much
-                    run_translated = run_translated[:last_space + 1]
-                    current_pos = current_pos - (len(run_translated) - last_space - 1)
-            
-            distributed_texts.append(run_translated)
+            # Clear all other runs to avoid duplication
+            for i in range(1, len(runs)):
+                runs[i]['translated_text'] = ''
         
-        # If we have remaining text, append to last run
-        if current_pos < translated_length:
-            remaining = translated_text[current_pos:]
-            if distributed_texts:
-                distributed_texts[-1] += remaining
-        
-        # Update run data with distributed translations
-        for i, run_data in enumerate(runs):
-            if i < len(distributed_texts):
-                run_data['translated_text'] = distributed_texts[i]
-            else:
-                run_data['translated_text'] = run_data['text']  # Fallback to original
+        self.logger.debug(f"Distributed translation cleanly: '{translated_text[:50]}...'")
     
     def _apply_run_formatting(self, run, formatting: Dict[str, Any]) -> None:
-        """Apply formatting to a text run"""
+        """Apply formatting to a text run with enhanced font handling"""
         try:
             if hasattr(run, 'font'):
                 font = run.font
                 
-                # Apply font name
+                # Apply font name with fallback for problematic fonts
                 if 'font_name' in formatting and formatting['font_name']:
-                    font.name = formatting['font_name']
+                    font_name = formatting['font_name']
+                    
+                    # Skip problematic symbol fonts
+                    problematic_fonts = ['Zapf Dingbats', 'Symbol', 'Wingdings', 'Webdings']
+                    if any(prob_font.lower() in font_name.lower() for prob_font in problematic_fonts):
+                        # Use a safe default font instead
+                        font.name = 'Calibri'
+                        self.logger.debug(f"Replaced problematic font '{font_name}' with Calibri")
+                    else:
+                        font.name = font_name
                 
                 # Apply font size
                 if 'font_size' in formatting and formatting['font_size']:
-                    font.size = Pt(formatting['font_size'])
+                    try:
+                        font.size = Pt(formatting['font_size'])
+                    except Exception as size_error:
+                        self.logger.debug(f"Error setting font size: {size_error}")
                 
                 # Apply bold, italic, underline
                 if 'bold' in formatting:
@@ -406,8 +396,11 @@ class PPTXProcessor(LoggerMixin):
                 
                 # Apply font color
                 if 'font_color' in formatting and formatting['font_color']:
-                    r, g, b = formatting['font_color']
-                    font.color.rgb = RGBColor(r, g, b)
+                    try:
+                        r, g, b = formatting['font_color']
+                        font.color.rgb = RGBColor(r, g, b)
+                    except Exception as color_error:
+                        self.logger.debug(f"Error setting font color: {color_error}")
                     
         except Exception as e:
             self.logger.debug(f"Error applying run formatting: {e}")
@@ -440,7 +433,7 @@ class PPTXProcessor(LoggerMixin):
         if not self.text_elements:
             raise ValidationError("No text elements to apply")
         
-        self.logger.info("Applying batch translations to presentation")
+        self.logger.info("Applying FIXED batch translations to presentation")
         
         applied_count = 0
         error_count = 0
@@ -450,7 +443,7 @@ class PPTXProcessor(LoggerMixin):
                 if element['translated_text'] is None:
                     continue
                 
-                # Distribute translation back to runs
+                # Use the FIXED distribution method
                 self._distribute_translation_to_runs(element)
                 
                 # Apply translated text to each run
@@ -468,13 +461,13 @@ class PPTXProcessor(LoggerMixin):
                 self._apply_paragraph_formatting(element['paragraph_ref'], element['paragraph_formatting'])
                 
                 applied_count += 1
-                self.logger.debug(f"Applied translation to paragraph {element['id']}")
+                self.logger.debug(f"Applied CLEAN translation to paragraph {element['id']}")
                 
             except Exception as e:
                 self.logger.error(f"Error applying translation to element {element.get('id', 'unknown')}: {e}")
                 error_count += 1
         
-        self.logger.info(f"Applied {applied_count} translations, {error_count} errors")
+        self.logger.info(f"Applied {applied_count} CLEAN translations, {error_count} errors")
         self.processing_stats['error_count'] += error_count
     
     def save_presentation(self) -> str:
