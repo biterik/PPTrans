@@ -309,14 +309,14 @@ class PPTransMainWindow(LoggerMixin):
             self.status_var.set("Select a PowerPoint file to begin")
     
     def _update_file_info(self):
-        """Update file information display"""
+        """Update file information display - FIXED: Added advanced_settings parameter"""
         if not self.current_file or not os.path.exists(self.current_file):
             self.file_info_var.set("")
             return
         
         try:
-            # Load presentation to get info
-            processor = PPTXProcessor()
+            # Load presentation to get info - FIX: Pass advanced_settings from config
+            processor = PPTXProcessor(self.config.get_section("advanced"))
             processor.load_presentation(self.current_file)
             info = processor.get_presentation_info()
             

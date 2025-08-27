@@ -1,5 +1,5 @@
 """
-PPTX Processor - Fixed to match GUI workflow and expectations
+PPTX Processor with batch translation support
 """
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ from utils.exceptions import ValidationError, PPTXProcessingError
 
 
 class PPTXProcessor(LoggerMixin):
-    """PowerPoint processor that matches GUI expectations"""
+    """PowerPoint processor optimized for batch translation"""
     
     def __init__(self, advanced_settings: dict):
         """Initialize with advanced settings from config"""
@@ -21,7 +21,6 @@ class PPTXProcessor(LoggerMixin):
         self.presentation = None
         self.current_file = None
         self.text_elements = []
-        self.translated_elements = []
         self.processing_stats = {
             'total_slides': 0,
             'processed_slides': 0,
@@ -31,10 +30,10 @@ class PPTXProcessor(LoggerMixin):
             'error_count': 0
         }
         
-        self.logger.info("PPTXProcessor initialized")
+        self.logger.info("Batch-enabled PPTXProcessor initialized")
         
     def load_presentation(self, file_path: str):
-        """Load the PowerPoint presentation - matches GUI call"""
+        """Load the PowerPoint presentation"""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"PowerPoint file not found: {file_path}")
             
@@ -48,7 +47,7 @@ class PPTXProcessor(LoggerMixin):
             raise PPTXProcessingError(f"Cannot load PowerPoint file: {e}", file_path=file_path)
     
     def get_presentation_info(self) -> Dict[str, Any]:
-        """Get presentation information - matches GUI call"""
+        """Get presentation information"""
         if not self.presentation:
             return {'total_slides': 0}
         
@@ -171,11 +170,10 @@ class PPTXProcessor(LoggerMixin):
     
     def extract_text_elements(self, slide_range: str = "all") -> List[Dict[str, Any]]:
         """
-        Extract text elements from specified slides - matches GUI call
-        Returns the extracted elements (GUI expects return value)
+        Extract text elements from specified slides with smart grouping for batch translation
         """
         if not self.presentation:
-            raise ProcessingError("No presentation loaded")
+            raise PPTXProcessingError("No presentation loaded")
         
         slide_indices = self.parse_slide_range(slide_range)
         self.text_elements = []
@@ -192,94 +190,197 @@ class PPTXProcessor(LoggerMixin):
                     if hasattr(shape, 'text_frame') and shape.text_frame:
                         text_frame = shape.text_frame
                         
+                        # Group by paragraph for better context in batch translation
                         for para_idx, paragraph in enumerate(text_frame.paragraphs):
                             if not paragraph.text.strip():
                                 continue
                                 
                             paragraph_formatting = self._extract_paragraph_formatting(paragraph)
                             
-                            # Store each run separately to preserve individual formatting
+                            # Collect all runs in this paragraph
+                            paragraph_runs = []
+                            paragraph_text_parts = []
+                            
                             for run_idx, run in enumerate(paragraph.runs):
-                                if run.text.strip():
+                                if run.text:  # Include even empty runs to preserve structure
                                     run_formatting = self._extract_run_formatting(run)
                                     
-                                    element = {
-                                        'id': element_id,
-                                        'slide_index': slide_idx,
-                                        'shape_index': shape_idx,
-                                        'paragraph_index': para_idx,
+                                    run_data = {
                                         'run_index': run_idx,
-                                        'original_text': run.text,
-                                        'translated_text': None,
-                                        'run_formatting': run_formatting,
-                                        'paragraph_formatting': paragraph_formatting,
-                                        # Store references for applying changes
-                                        'shape_ref': shape,
-                                        'paragraph_ref': paragraph,
+                                        'text': run.text,
+                                        'formatting': run_formatting,
                                         'run_ref': run
                                     }
-                                    
-                                    self.text_elements.append(element)
-                                    element_id += 1
-                                    slide_elements += 1
+                                    paragraph_runs.append(run_data)
+                                    paragraph_text_parts.append(run.text)
+                            
+                            if paragraph_runs:  # Only if we have runs with text
+                                # Create a paragraph-level element for batch translation
+                                element = {
+                                    'id': element_id,
+                                    'slide_index': slide_idx,
+                                    'shape_index': shape_idx,
+                                    'paragraph_index': para_idx,
+                                    'type': 'paragraph',
+                                    'original_text': ''.join(paragraph_text_parts),
+                                    'translated_text': None,
+                                    'paragraph_formatting': paragraph_formatting,
+                                    'runs': paragraph_runs,
+                                    'shape_ref': shape,
+                                    'paragraph_ref': paragraph
+                                }
+                                
+                                self.text_elements.append(element)
+                                element_id += 1
+                                slide_elements += 1
                 
                 self.processing_stats['processed_slides'] += 1
-                self.logger.debug(f"Slide {slide_idx + 1}: Found {slide_elements} text elements")
+                self.logger.debug(f"Slide {slide_idx + 1}: Found {slide_elements} paragraph elements")
                 
             except Exception as e:
                 self.logger.error(f"Error processing slide {slide_idx + 1}: {e}")
                 self.processing_stats['error_count'] += 1
         
         self.processing_stats['text_elements_found'] = len(self.text_elements)
-        self.logger.info(f"Extracted {len(self.text_elements)} text elements from {len(slide_indices)} slides")
+        self.logger.info(f"Extracted {len(self.text_elements)} paragraph elements from {len(slide_indices)} slides")
         
-        return self.text_elements  # GUI expects return value
+        return self.text_elements
     
     def translate_text_elements(self, translate_callback: Callable[[str], str]) -> None:
         """
-        Translate extracted text elements using the provided callback
-        The callback is expected to do the actual translation
-        This matches the GUI workflow where translate_with_progress does the translation
+        Translate extracted text elements using batch processing
+        
+        Args:
+            translate_callback: Function that handles translation - now expects to handle batches
         """
         if not self.text_elements:
             raise ValidationError("No text elements to translate")
         
-        self.logger.info(f"Starting translation of {len(self.text_elements)} text elements")
+        # Check if the translator supports batch translation
+        from core.translator import PPTransTranslator
+        translator = PPTransTranslator(self.settings.get('translation', {}))
         
-        translated_count = 0
-        skipped_count = 0
-        error_count = 0
+        # Collect all text to translate
+        texts_to_translate = []
+        element_map = {}  # Map translation results back to elements
         
         for i, element in enumerate(self.text_elements):
-            try:
-                original_text = element['original_text']
-                
-                if not original_text.strip():
-                    skipped_count += 1
-                    continue
-                
-                # Use the provided callback to translate (this is where GUI's translate_with_progress is called)
-                translated_text = translate_callback(original_text)
-                
-                if translated_text and translated_text.strip():
-                    element['translated_text'] = translated_text
-                    translated_count += 1
-                    self.logger.debug(f"Translated element {element['id']}: '{original_text[:30]}...' -> '{translated_text[:30]}...'")
-                else:
-                    element['translated_text'] = original_text  # Keep original if translation failed
-                    skipped_count += 1
-                    self.logger.warning(f"Translation failed for element {element['id']}, keeping original text")
-                
-            except Exception as e:
-                self.logger.error(f"Error translating element {i}: {e}")
-                element['translated_text'] = element['original_text']  # Keep original on error
-                error_count += 1
+            original_text = element['original_text']
+            if original_text and original_text.strip():
+                texts_to_translate.append(original_text)
+                element_map[len(texts_to_translate) - 1] = i
+            else:
+                element['translated_text'] = original_text  # Keep empty/whitespace as is
         
-        self.processing_stats['translated_elements'] = translated_count
-        self.processing_stats['skipped_elements'] = skipped_count
-        self.processing_stats['error_count'] += error_count
+        if not texts_to_translate:
+            self.logger.info("No text found that needs translation")
+            return
         
-        self.logger.info(f"Translation completed: {translated_count} translated, {skipped_count} skipped, {error_count} errors")
+        self.logger.info(f"Starting batch translation of {len(texts_to_translate)} text elements")
+        
+        try:
+            # Use batch translation
+            translated_texts = translator.translate_text_batch(
+                texts_to_translate, 
+                source_lang='auto', 
+                target_lang='en'
+            )
+            
+            # Map results back to elements
+            translated_count = 0
+            for batch_idx, translated_text in enumerate(translated_texts):
+                if batch_idx in element_map:
+                    element_idx = element_map[batch_idx]
+                    element = self.text_elements[element_idx]
+                    
+                    if translated_text and translated_text != element['original_text']:
+                        element['translated_text'] = translated_text
+                        translated_count += 1
+                        self.logger.debug(f"Translated paragraph {element['id']}: '{element['original_text'][:50]}...' -> '{translated_text[:50]}...'")
+                    else:
+                        element['translated_text'] = element['original_text']
+            
+            self.processing_stats['translated_elements'] = translated_count
+            self.processing_stats['skipped_elements'] = len(self.text_elements) - translated_count
+            
+            self.logger.info(f"Batch translation completed: {translated_count}/{len(self.text_elements)} elements translated")
+            
+        except Exception as e:
+            self.logger.error(f"Batch translation failed: {e}")
+            # Fall back to original text for all elements
+            for element in self.text_elements:
+                element['translated_text'] = element['original_text']
+            self.processing_stats['error_count'] += 1
+    
+    def _distribute_translation_to_runs(self, element: Dict[str, Any]) -> None:
+        """
+        Distribute translated paragraph text back to individual runs
+        This is the tricky part - we need to map the translated text back to the original run structure
+        """
+        original_text = element['original_text']
+        translated_text = element['translated_text']
+        runs = element['runs']
+        
+        if not translated_text or translated_text == original_text:
+            # No translation occurred, keep original run texts
+            return
+        
+        # Simple approach: if translation is close in length, distribute proportionally
+        # More sophisticated approach would use word alignment
+        
+        original_length = len(original_text)
+        translated_length = len(translated_text)
+        
+        if original_length == 0:
+            return
+        
+        # Calculate proportional distribution
+        distributed_texts = []
+        current_pos = 0
+        
+        for run_data in runs:
+            run_text = run_data['text']
+            run_length = len(run_text)
+            
+            if run_length == 0:
+                distributed_texts.append('')
+                continue
+            
+            # Calculate proportion of translated text for this run
+            proportion = run_length / original_length
+            target_length = int(translated_length * proportion)
+            
+            # Extract portion of translated text
+            if current_pos + target_length <= translated_length:
+                run_translated = translated_text[current_pos:current_pos + target_length]
+                current_pos += target_length
+            else:
+                # Take remaining text for last run
+                run_translated = translated_text[current_pos:]
+                current_pos = translated_length
+            
+            # Handle word boundaries to avoid splitting words
+            if run_translated and current_pos < translated_length:
+                # Try to end at word boundary
+                last_space = run_translated.rfind(' ')
+                if last_space > len(run_translated) * 0.5:  # Only if we're not cutting too much
+                    run_translated = run_translated[:last_space + 1]
+                    current_pos = current_pos - (len(run_translated) - last_space - 1)
+            
+            distributed_texts.append(run_translated)
+        
+        # If we have remaining text, append to last run
+        if current_pos < translated_length:
+            remaining = translated_text[current_pos:]
+            if distributed_texts:
+                distributed_texts[-1] += remaining
+        
+        # Update run data with distributed translations
+        for i, run_data in enumerate(runs):
+            if i < len(distributed_texts):
+                run_data['translated_text'] = distributed_texts[i]
+            else:
+                run_data['translated_text'] = run_data['text']  # Fallback to original
     
     def _apply_run_formatting(self, run, formatting: Dict[str, Any]) -> None:
         """Apply formatting to a text run"""
@@ -335,11 +436,11 @@ class PPTXProcessor(LoggerMixin):
             self.logger.debug(f"Error applying paragraph formatting: {e}")
     
     def apply_translations(self) -> None:
-        """Apply translated text to the presentation with preserved formatting - matches GUI call"""
+        """Apply translated text to the presentation with preserved formatting"""
         if not self.text_elements:
             raise ValidationError("No text elements to apply")
         
-        self.logger.info("Applying translations to presentation")
+        self.logger.info("Applying batch translations to presentation")
         
         applied_count = 0
         error_count = 0
@@ -349,18 +450,25 @@ class PPTXProcessor(LoggerMixin):
                 if element['translated_text'] is None:
                     continue
                 
-                # Get the run reference
-                run = element['run_ref']
+                # Distribute translation back to runs
+                self._distribute_translation_to_runs(element)
                 
-                # Apply the translated text
-                run.text = element['translated_text']
+                # Apply translated text to each run
+                for run_data in element['runs']:
+                    run = run_data['run_ref']
+                    translated_text = run_data.get('translated_text', run_data['text'])
+                    
+                    # Apply the translated text
+                    run.text = translated_text
+                    
+                    # Reapply formatting
+                    self._apply_run_formatting(run, run_data['formatting'])
                 
-                # Reapply all formatting
-                self._apply_run_formatting(run, element['run_formatting'])
+                # Apply paragraph formatting
                 self._apply_paragraph_formatting(element['paragraph_ref'], element['paragraph_formatting'])
                 
                 applied_count += 1
-                self.logger.debug(f"Applied translation to element {element['id']}")
+                self.logger.debug(f"Applied translation to paragraph {element['id']}")
                 
             except Exception as e:
                 self.logger.error(f"Error applying translation to element {element.get('id', 'unknown')}: {e}")
@@ -370,9 +478,9 @@ class PPTXProcessor(LoggerMixin):
         self.processing_stats['error_count'] += error_count
     
     def save_presentation(self) -> str:
-        """Save the modified presentation - matches GUI call (returns path)"""
+        """Save the modified presentation"""
         if not self.presentation or not self.current_file:
-            raise ProcessingError("No presentation loaded to save")
+            raise PPTXProcessingError("No presentation loaded to save")
             
         try:
             # Create output filename
@@ -387,22 +495,5 @@ class PPTXProcessor(LoggerMixin):
             raise PPTXProcessingError(f"Cannot save presentation: {e}", file_path=str(output_path))
     
     def get_processing_stats(self) -> Dict[str, Any]:
-        """Get processing statistics - matches GUI call"""
+        """Get processing statistics"""
         return self.processing_stats.copy()
-    
-    def get_text_elements_preview(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get a preview of text elements for debugging"""
-        preview = []
-        for element in self.text_elements[:limit]:
-            preview.append({
-                'id': element['id'],
-                'slide': element['slide_index'] + 1,
-                'original_text': element['original_text'][:100] + ('...' if len(element['original_text']) > 100 else ''),
-                'translated_text': (element['translated_text'][:100] + ('...' if len(element['translated_text']) > 100 else '')) if element['translated_text'] else None,
-                'formatting': {
-                    'font_name': element['run_formatting'].get('font_name'),
-                    'font_size': element['run_formatting'].get('font_size'),
-                    'alignment': element['paragraph_formatting'].get('alignment')
-                }
-            })
-        return preview
