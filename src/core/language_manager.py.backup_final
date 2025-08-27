@@ -1,6 +1,5 @@
 """
 Complete Language manager for PPTrans with all GUI-required methods
-Final version with correct method signatures
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -48,10 +47,6 @@ class LanguageManager(LoggerMixin):
         
         code = code.lower().strip()
         
-        # Handle auto-detect
-        if code == 'auto':
-            return True
-        
         # Check direct match
         if code in self.languages:
             return True
@@ -82,10 +77,6 @@ class LanguageManager(LoggerMixin):
             return code
         
         code = code.lower().strip()
-        
-        # Handle auto-detect
-        if code == 'auto':
-            return 'auto'
         
         # Check aliases first
         if code in self.language_aliases:
@@ -121,9 +112,6 @@ class LanguageManager(LoggerMixin):
         if not code:
             return None
         
-        if code == 'auto':
-            return 'Auto-detect'
-        
         code = self.normalize_language_code(code)
         return self.languages.get(code)
     
@@ -136,24 +124,17 @@ class LanguageManager(LoggerMixin):
         """
         return {code: self.languages[code] for code in self.popular_languages if code in self.languages}
     
-    def get_language_list(self, include_auto_detect: bool = True, popular_first: bool = False) -> List[Tuple[str, str]]:
+    def get_language_list(self, popular_first: bool = False) -> List[Tuple[str, str]]:
         """
         Get list of languages formatted for GUI dropdowns
-        This is the method the GUI is looking for with correct parameters!
+        This is the method the GUI is looking for!
         
         Args:
-            include_auto_detect: If True, include "Auto-detect" option at the top
             popular_first: If True, put popular languages first
             
         Returns:
             List of tuples (language_code, language_name)
         """
-        result = []
-        
-        # Add auto-detect option if requested
-        if include_auto_detect:
-            result.append(("auto", "Auto-detect"))
-        
         if popular_first:
             # Get popular languages first
             popular_langs = [(code, self.languages[code]) 
@@ -166,14 +147,12 @@ class LanguageManager(LoggerMixin):
             remaining_langs = [(code, self.languages[code]) for code in remaining_codes]
             remaining_langs.sort(key=lambda x: x[1])  # Sort by name
             
-            result.extend(popular_langs + remaining_langs)
+            return popular_langs + remaining_langs
         else:
             # Return all languages sorted by name
             all_langs = [(code, name) for code, name in self.languages.items()]
             all_langs.sort(key=lambda x: x[1])  # Sort by name
-            result.extend(all_langs)
-        
-        return result
+            return all_langs
     
     def search_languages(self, query: str) -> Dict[str, str]:
         """
@@ -215,7 +194,7 @@ class LanguageManager(LoggerMixin):
             choices.append(("Auto-detect", "auto"))
         
         # Add all languages with formatted display names
-        language_list = self.get_language_list(include_auto_detect=False, popular_first=True)
+        language_list = self.get_language_list(popular_first=True)
         for code, name in language_list:
             display_name = f"{name.title()} ({code})"
             choices.append((display_name, code))

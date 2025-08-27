@@ -1,6 +1,28 @@
+#!/usr/bin/env python3
 """
+Complete LanguageManager fix with all methods needed by the GUI
+"""
+
+import sys
+import os
+from pathlib import Path
+
+def backup_file(file_path):
+    """Create a backup of the original file"""
+    backup_path = Path(str(file_path) + '.backup3')
+    if file_path.exists():
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"✅ Backup created: {backup_path}")
+    return backup_path
+
+def create_complete_language_manager():
+    """Create a complete LanguageManager with all GUI-required methods"""
+    
+    content = '''"""
 Complete Language manager for PPTrans with all GUI-required methods
-Final version with correct method signatures
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -48,10 +70,6 @@ class LanguageManager(LoggerMixin):
         
         code = code.lower().strip()
         
-        # Handle auto-detect
-        if code == 'auto':
-            return True
-        
         # Check direct match
         if code in self.languages:
             return True
@@ -82,10 +100,6 @@ class LanguageManager(LoggerMixin):
             return code
         
         code = code.lower().strip()
-        
-        # Handle auto-detect
-        if code == 'auto':
-            return 'auto'
         
         # Check aliases first
         if code in self.language_aliases:
@@ -121,9 +135,6 @@ class LanguageManager(LoggerMixin):
         if not code:
             return None
         
-        if code == 'auto':
-            return 'Auto-detect'
-        
         code = self.normalize_language_code(code)
         return self.languages.get(code)
     
@@ -136,24 +147,17 @@ class LanguageManager(LoggerMixin):
         """
         return {code: self.languages[code] for code in self.popular_languages if code in self.languages}
     
-    def get_language_list(self, include_auto_detect: bool = True, popular_first: bool = False) -> List[Tuple[str, str]]:
+    def get_language_list(self, popular_first: bool = False) -> List[Tuple[str, str]]:
         """
         Get list of languages formatted for GUI dropdowns
-        This is the method the GUI is looking for with correct parameters!
+        This is the method the GUI is looking for!
         
         Args:
-            include_auto_detect: If True, include "Auto-detect" option at the top
             popular_first: If True, put popular languages first
             
         Returns:
             List of tuples (language_code, language_name)
         """
-        result = []
-        
-        # Add auto-detect option if requested
-        if include_auto_detect:
-            result.append(("auto", "Auto-detect"))
-        
         if popular_first:
             # Get popular languages first
             popular_langs = [(code, self.languages[code]) 
@@ -166,14 +170,12 @@ class LanguageManager(LoggerMixin):
             remaining_langs = [(code, self.languages[code]) for code in remaining_codes]
             remaining_langs.sort(key=lambda x: x[1])  # Sort by name
             
-            result.extend(popular_langs + remaining_langs)
+            return popular_langs + remaining_langs
         else:
             # Return all languages sorted by name
             all_langs = [(code, name) for code, name in self.languages.items()]
             all_langs.sort(key=lambda x: x[1])  # Sort by name
-            result.extend(all_langs)
-        
-        return result
+            return all_langs
     
     def search_languages(self, query: str) -> Dict[str, str]:
         """
@@ -215,7 +217,7 @@ class LanguageManager(LoggerMixin):
             choices.append(("Auto-detect", "auto"))
         
         # Add all languages with formatted display names
-        language_list = self.get_language_list(include_auto_detect=False, popular_first=True)
+        language_list = self.get_language_list(popular_first=True)
         for code, name in language_list:
             display_name = f"{name.title()} ({code})"
             choices.append((display_name, code))
@@ -329,3 +331,118 @@ class LanguageManager(LoggerMixin):
             return f"{name.title()} ({code})"
         else:
             return code  # Fallback to just the code
+'''
+    
+    return content
+
+def apply_complete_language_manager_fix():
+    """Apply the complete language manager fix"""
+    print("\n=== Applying Complete LanguageManager Fix ===")
+    
+    lang_mgr_path = Path('src/core/language_manager.py')
+    if not lang_mgr_path.exists():
+        print(f"❌ File not found: {lang_mgr_path}")
+        return False
+    
+    # Create backup
+    backup_file(lang_mgr_path)
+    
+    try:
+        # Write the complete language manager
+        complete_content = create_complete_language_manager()
+        with open(lang_mgr_path, 'w', encoding='utf-8') as f:
+            f.write(complete_content)
+        
+        print(f"✅ Applied complete LanguageManager fix to {lang_mgr_path}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error applying LanguageManager fix: {e}")
+        return False
+
+def test_complete_language_manager():
+    """Test the complete language manager"""
+    print("\n=== Testing Complete LanguageManager ===")
+    
+    try:
+        # Add src to path
+        src_path = Path('src').absolute()
+        if str(src_path) not in sys.path:
+            sys.path.insert(0, str(src_path))
+        
+        # Reimport to get the new version
+        import importlib
+        if 'core.language_manager' in sys.modules:
+            importlib.reload(sys.modules['core.language_manager'])
+        
+        from core.language_manager import LanguageManager
+        
+        # Test the language manager
+        lang_mgr = LanguageManager()
+        print(f"✅ LanguageManager loaded with {len(lang_mgr.get_all_languages())} languages")
+        
+        # Test the method the GUI needs
+        language_list = lang_mgr.get_language_list(popular_first=True)
+        print(f"✅ get_language_list() works: {len(language_list)} languages")
+        print(f"   First few: {language_list[:3]}")
+        
+        # Test other GUI methods
+        choices = lang_mgr.get_language_choices_for_gui()
+        print(f"✅ get_language_choices_for_gui() works: {len(choices)} choices")
+        print(f"   First choice: {choices[0]}")
+        
+        # Test validation methods
+        print(f"✅ is_valid_language_code('en'): {lang_mgr.is_valid_language_code('en')}")
+        print(f"✅ is_valid_language_code('de'): {lang_mgr.is_valid_language_code('de')}")
+        
+        # Test display name extraction
+        test_display = "English (en)"
+        extracted_code = lang_mgr.get_language_code_from_display_name(test_display)
+        print(f"✅ get_language_code_from_display_name('{test_display}'): {extracted_code}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Complete LanguageManager test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def main():
+    """Main function to apply and test the complete fix"""
+    print("Complete LanguageManager Fix for PPTrans GUI")
+    print("=" * 55)
+    
+    # Check we're in the right directory
+    if not Path('src').exists():
+        print("❌ Please run this script from the PPTrans project root directory")
+        return False
+    
+    success = True
+    
+    # Apply the complete fix
+    success &= apply_complete_language_manager_fix()
+    
+    # Test the complete fix
+    if success:
+        success &= test_complete_language_manager()
+    
+    print("\n" + "=" * 55)
+    if success:
+        print("🎉 Complete LanguageManager fix applied and tested!")
+        print("\n✨ Added methods:")
+        print("   - get_language_list(popular_first=False)")
+        print("   - get_language_choices_for_gui(include_auto=True)")
+        print("   - get_language_code_from_display_name(display_name)")
+        print("   - format_language_display_name(code)")
+        print("   - get_common_language_choices_for_gui()")
+        print("   - All validation and normalization methods")
+        print("\n🔧 Next step:")
+        print("   Test the GUI: python src/main.py")
+    else:
+        print("❌ Some issues remain. Please check the output above.")
+    
+    return success
+
+if __name__ == "__main__":
+    main()

@@ -1,20 +1,25 @@
 """
-PowerPoint processor for PPTrans - Complete working version
-Handles PPTX file manipulation with proper type handling and all required methods
+PowerPoint processor for PPTrans - handles PPTX file manipulation
+Complete working version with proper text application methods
 """
 
 import os
 import shutil
-import re
 from datetime import datetime
 from typing import List, Dict, Optional, Union, Any
 from pathlib import Path
+import re
 
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
 
 from utils.logger import LoggerMixin, log_performance
+from utils.exceptions import (
+    PPTXProcessingError, FileNotFoundError, ValidationError,
+    TranslationError, ConfigurationError
+)
 
 
 class ProcessingStats:
@@ -68,8 +73,7 @@ class PPTXProcessor(LoggerMixin):
             
         Raises:
             FileNotFoundError: If file doesn't exist
-            ValueError: If file is not a valid PPTX
-            RuntimeError: If loading fails
+            PPTXProcessingError: If file cannot be loaded
         """
         file_path = Path(file_path)
         
@@ -77,7 +81,7 @@ class PPTXProcessor(LoggerMixin):
             raise FileNotFoundError(f"File not found: {file_path}")
         
         if not file_path.suffix.lower() == '.pptx':
-            raise ValueError(f"File is not a PowerPoint presentation: {file_path}")
+            raise ValidationError(f"File is not a PowerPoint presentation: {file_path}")
         
         try:
             self.logger.info(f"Loading presentation: {file_path}")
@@ -100,68 +104,13 @@ class PPTXProcessor(LoggerMixin):
             self.logger.info(f"Presentation loaded successfully: {slide_count} slides")
             
         except Exception as e:
-            raise RuntimeError(f"Failed to load presentation: {str(e)}")
+            raise PPTXProcessingError(f"Failed to load presentation: {str(e)}")
     
     def get_slide_count(self) -> int:
         """Get the number of slides in the current presentation"""
         if not self.current_presentation:
             return 0
         return len(self.current_presentation.slides)
-    
-    def get_presentation_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current presentation
-        
-        Returns:
-            Dictionary containing presentation metadata
-        """
-        if not self.current_presentation or not self.current_file_path:
-            return {}
-        
-        try:
-            file_path = Path(self.current_file_path)
-            slide_count = len(self.current_presentation.slides)
-            
-            # Get file statistics
-            stat = file_path.stat()
-            file_size = stat.st_size
-            modified_time = datetime.fromtimestamp(stat.st_mtime)
-            
-            # Format file size
-            if file_size < 1024:
-                size_str = f"{file_size} bytes"
-            elif file_size < 1024 * 1024:
-                size_str = f"{file_size / 1024:.1f} KB"
-            else:
-                size_str = f"{file_size / (1024 * 1024):.1f} MB"
-            
-            info = {
-                'filename': file_path.name,
-                'filepath': str(file_path),
-                'slide_count': slide_count,
-                'file_size': file_size,
-                'file_size_formatted': size_str,
-                'modified': modified_time,
-                'modified_formatted': modified_time.strftime('%Y-%m-%d %H:%M:%S')
-            }
-            
-            # Try to get presentation core properties
-            try:
-                core_props = self.current_presentation.core_properties
-                if hasattr(core_props, 'title') and core_props.title:
-                    info['title'] = core_props.title
-                if hasattr(core_props, 'author') and core_props.author:
-                    info['author'] = core_props.author
-                if hasattr(core_props, 'subject') and core_props.subject:
-                    info['subject'] = core_props.subject
-            except Exception:
-                pass  # Core properties not available or accessible
-            
-            return info
-            
-        except Exception as e:
-            self.logger.warning(f"Could not extract presentation info: {e}")
-            return {'error': str(e)}
     
     def parse_slide_range(self, range_str: str) -> List[int]:
         """
@@ -171,34 +120,35 @@ class PPTXProcessor(LoggerMixin):
             range_str: Range specification string (e.g., "1-5", "1,3,5", "all")
             
         Returns:
-            List of 0-based slide indices (guaranteed to be integers)
+            List of 0-based slide indices
             
         Raises:
-            ValueError: If range specification is invalid
+            ValidationError: If range specification is invalid
         """
         if not range_str or not range_str.strip():
-            raise ValueError("Empty slide range specification")
+            raise ValidationError("Empty slide range specification")
         
-        range_str = str(range_str).strip().lower()  # Ensure string type
+        range_str = range_str.strip().lower()
         max_slides = self.get_slide_count()
         
         if max_slides == 0:
-            raise ValueError("No presentation loaded")
+            raise ValidationError("No presentation loaded")
         
         # Handle "all" keyword
         if range_str == "all":
             return list(range(max_slides))
         
-        # Clean input: keep only digits, hyphens, and commas
-        cleaned = re.sub(r'[^0-9\-,]', '', range_str)
+        # Clean up the input - remove any non-digit, non-dash, non-comma characters
+        cleaned = re.sub(r'[^0-9\-,\s]', '', range_str)
+        cleaned = re.sub(r'\s+', '', cleaned)
         
         if not cleaned:
-            raise ValueError(f"Invalid slide range specification: '{range_str}' - no valid numbers found")
+            raise ValidationError(f"Invalid slide range specification: '{range_str}' contains no valid numbers")
         
         slide_indices = set()
         
         try:
-            # Split by commas
+            # Split by commas for multiple ranges/single slides
             parts = [part.strip() for part in cleaned.split(',') if part.strip()]
             
             for part in parts:
@@ -206,76 +156,63 @@ class PPTXProcessor(LoggerMixin):
                     # Handle range like "5-10"
                     range_parts = part.split('-')
                     if len(range_parts) != 2:
-                        raise ValueError(f"Invalid range format: '{part}' - expected 'start-end'")
+                        raise ValidationError(f"Invalid range format: '{part}' (should be 'start-end')")
                     
                     start_str, end_str = range_parts
                     if not start_str or not end_str:
-                        raise ValueError(f"Invalid range format: '{part}' - missing start or end")
+                        raise ValidationError(f"Invalid range format: '{part}' (missing start or end)")
                     
-                    # Convert to integers
                     start = int(start_str)
                     end = int(end_str)
                     
-                    # Validate range
                     if start < 1 or end < 1:
-                        raise ValueError(f"Slide numbers must be positive, got {start}-{end}")
+                        raise ValidationError(f"Slide numbers must be positive (got {start}-{end})")
                     
                     if start > end:
-                        raise ValueError(f"Invalid range: start ({start}) > end ({end})")
+                        raise ValidationError(f"Invalid range: start ({start}) > end ({end})")
                     
                     if start > max_slides or end > max_slides:
-                        raise ValueError(f"Slide range {start}-{end} exceeds available slides (1-{max_slides})")
+                        raise ValidationError(f"Slide range {start}-{end} exceeds available slides (1-{max_slides})")
                     
                     # Add all slides in range (convert to 0-based indexing)
-                    for slide_num in range(start - 1, end):
-                        slide_indices.add(int(slide_num))  # Ensure integer
+                    slide_indices.update(range(start - 1, end))
                     
                 else:
                     # Handle single slide
                     slide_num = int(part)
                     if slide_num < 1:
-                        raise ValueError(f"Slide number must be positive, got {slide_num}")
+                        raise ValidationError(f"Slide number must be positive (got {slide_num})")
                     if slide_num > max_slides:
-                        raise ValueError(f"Slide {slide_num} exceeds available slides (1-{max_slides})")
+                        raise ValidationError(f"Slide {slide_num} exceeds available slides (1-{max_slides})")
                     
-                    # Convert to 0-based indexing and ensure integer
-                    slide_indices.add(int(slide_num - 1))
+                    # Convert to 0-based indexing
+                    slide_indices.add(slide_num - 1)
         
-        except ValueError as ve:
-            raise ve  # Re-raise ValueError as-is
+        except ValueError as e:
+            raise ValidationError(f"Invalid slide range specification: {range_str}. Error: {str(e)}")
         except Exception as e:
-            raise ValueError(f"Error parsing slide range '{range_str}': {str(e)}")
+            raise ValidationError(f"Invalid slide range specification: {range_str}. Error: {str(e)}")
         
         if not slide_indices:
-            raise ValueError(f"No valid slides specified in range: {range_str}")
+            raise ValidationError(f"No valid slides specified in range: {range_str}")
         
-        # Convert to sorted list of integers
-        result = sorted([int(idx) for idx in slide_indices])
-        
-        # Double-check all elements are integers
-        assert all(isinstance(idx, int) for idx in result), "Result contains non-integer values"
-        
-        return result
+        # Return sorted list
+        return sorted(list(slide_indices))
     
     def extract_text_elements(self, slide_indices: List[int]) -> List[Dict]:
         """
         Extract text elements from specified slides
         
         Args:
-            slide_indices: List of slide indices (0-based) - must be integers
+            slide_indices: List of slide indices (0-based) to process
             
         Returns:
             List of text element dictionaries
         """
         if not self.current_presentation:
-            raise ValueError("No presentation loaded")
+            raise ValidationError("No presentation loaded")
         
-        # Ensure slide_indices are integers
-        slide_indices = [int(idx) for idx in slide_indices]
-        
-        # Create display list for logging (1-based)
-        display_slides = [idx + 1 for idx in slide_indices]
-        self.logger.info(f"Extracting text from slides: {display_slides}")
+        self.logger.info(f"Extracting text from slides: {[i+1 for i in slide_indices]}")
         
         text_elements = []
         
@@ -296,24 +233,25 @@ class PPTXProcessor(LoggerMixin):
                     
                     # Process each paragraph
                     for para_idx, paragraph in enumerate(text_frame.paragraphs):
-                        # Collect text from all runs in the paragraph
+                        # Get all text from the paragraph
                         paragraph_text = ""
                         formatting_info = {}
                         
+                        # Collect text from all runs
                         for run in paragraph.runs:
                             if run.text.strip():
                                 paragraph_text += run.text
                                 
-                                # Capture formatting from first run with content
+                                # Capture formatting from the first run with formatting
                                 if not formatting_info and run.text.strip():
                                     formatting_info = self._extract_formatting(run, paragraph)
                         
                         # Only add if there's actual text content
                         if paragraph_text.strip():
                             text_element = {
-                                'slide_index': int(slide_idx),  # Ensure integer
-                                'shape_index': int(shape_idx),  # Ensure integer
-                                'paragraph_index': int(para_idx),  # Ensure integer
+                                'slide_index': slide_idx,
+                                'shape_index': shape_idx,
+                                'paragraph_index': para_idx,
                                 'original_text': paragraph_text,
                                 'translated_text': '',
                                 'formatting': formatting_info,
@@ -332,43 +270,33 @@ class PPTXProcessor(LoggerMixin):
         return text_elements
     
     def _extract_formatting(self, run, paragraph) -> Dict:
-        """
-        Extract formatting information from a text run and paragraph
-        
-        Args:
-            run: Text run object
-            paragraph: Paragraph object
-            
-        Returns:
-            Dictionary containing formatting information
-        """
+        """Extract formatting information from a text run and paragraph"""
         formatting = {}
         
         try:
-            # Extract run-level formatting
-            if hasattr(run, 'font'):
-                font = run.font
-                
-                if hasattr(font, 'name') and font.name:
-                    formatting['font_name'] = font.name
-                
-                if hasattr(font, 'size') and font.size:
-                    formatting['font_size'] = font.size.pt
-                
-                formatting['bold'] = font.bold if font.bold is not None else False
-                formatting['italic'] = font.italic if font.italic is not None else False
-                formatting['underline'] = font.underline if font.underline is not None else False
-                
-                # Try to extract font color
-                try:
-                    if hasattr(font, 'color') and font.color and hasattr(font.color, 'rgb'):
-                        rgb = font.color.rgb
-                        formatting['font_color'] = (rgb.r, rgb.g, rgb.b)
-                except Exception:
-                    pass  # Color extraction can fail
+            # Extract run formatting
+            font = run.font
             
-            # Extract paragraph-level formatting
-            if hasattr(paragraph, 'alignment') and paragraph.alignment is not None:
+            if font.name:
+                formatting['font_name'] = font.name
+            
+            if font.size:
+                formatting['font_size'] = font.size.pt
+            
+            formatting['bold'] = font.bold if font.bold is not None else False
+            formatting['italic'] = font.italic if font.italic is not None else False
+            formatting['underline'] = font.underline if font.underline is not None else False
+            
+            # Extract color if possible
+            try:
+                if font.color and font.color.rgb:
+                    rgb = font.color.rgb
+                    formatting['font_color'] = (rgb.r, rgb.g, rgb.b)
+            except Exception:
+                pass
+            
+            # Extract paragraph alignment
+            if paragraph.alignment is not None:
                 alignment_map = {
                     PP_ALIGN.LEFT: 'left',
                     PP_ALIGN.CENTER: 'center',
@@ -393,7 +321,7 @@ class PPTXProcessor(LoggerMixin):
             target_lang: Target language code
         """
         if not self.text_elements:
-            raise ValueError("No text elements to translate")
+            raise ValidationError("No text elements to translate")
         
         self.logger.info(f"Starting translation of {len(self.text_elements)} text elements")
         
@@ -404,7 +332,6 @@ class PPTXProcessor(LoggerMixin):
             try:
                 original_text = element['original_text']
                 if not original_text.strip():
-                    element['translated_text'] = original_text
                     continue
                 
                 # Translate the text
@@ -433,10 +360,10 @@ class PPTXProcessor(LoggerMixin):
     def apply_translations(self) -> None:
         """Apply translated text back to the presentation"""
         if not self.current_presentation:
-            raise ValueError("No presentation loaded")
+            raise ValidationError("No presentation loaded")
         
         if not self.text_elements:
-            raise ValueError("No text elements to apply")
+            raise ValidationError("No text elements to apply")
         
         self.logger.info("Applying translations to presentation")
         
@@ -468,7 +395,7 @@ class PPTXProcessor(LoggerMixin):
     
     def _apply_text_simple(self, shape, text: str) -> bool:
         """
-        Simple text application that works reliably
+        Simple text application that avoids complex formatting issues
         
         Args:
             shape: PowerPoint shape object
@@ -478,37 +405,31 @@ class PPTXProcessor(LoggerMixin):
             True if successful, False otherwise
         """
         try:
-            # Method 1: Direct text assignment
+            # Try the most direct approach first
             if hasattr(shape, 'text'):
                 shape.text = text
                 return True
             
-            # Method 2: Text frame assignment
+            # Try text_frame approach
             if hasattr(shape, 'text_frame') and shape.text_frame:
                 shape.text_frame.text = text
                 return True
             
-            # Method 3: Paragraph and run approach
+            # Try paragraph approach
             if (hasattr(shape, 'text_frame') and 
                 shape.text_frame and 
-                hasattr(shape.text_frame, 'paragraphs') and
                 shape.text_frame.paragraphs):
                 
-                # Clear all paragraphs except the first
-                while len(shape.text_frame.paragraphs) > 1:
-                    p = shape.text_frame.paragraphs[-1]
-                    if hasattr(p, 'clear'):
-                        p.clear()
+                # Clear existing content
+                for paragraph in shape.text_frame.paragraphs[1:]:
+                    paragraph.clear()
                 
                 # Set text in first paragraph
                 first_paragraph = shape.text_frame.paragraphs[0]
-                if hasattr(first_paragraph, 'clear'):
-                    first_paragraph.clear()
-                
-                if hasattr(first_paragraph, 'add_run'):
-                    run = first_paragraph.add_run()
-                    run.text = text
-                    return True
+                first_paragraph.clear()
+                run = first_paragraph.add_run()
+                run.text = text
+                return True
             
             return False
             
@@ -527,11 +448,10 @@ class PPTXProcessor(LoggerMixin):
             Path to the saved file
             
         Raises:
-            ValueError: If no presentation is loaded
-            RuntimeError: If saving fails
+            PPTXProcessingError: If saving fails
         """
         if not self.current_presentation:
-            raise ValueError("No presentation loaded")
+            raise ValidationError("No presentation loaded")
         
         if output_path is None:
             # Generate output filename
@@ -553,16 +473,11 @@ class PPTXProcessor(LoggerMixin):
             return output_path
             
         except Exception as e:
-            raise RuntimeError(f"Failed to save presentation: {str(e)}")
+            raise PPTXProcessingError(f"Failed to save presentation: {str(e)}")
     
-    def get_processing_stats(self) -> Dict[str, Any]:
-        """
-        Get processing statistics
-        
-        Returns:
-            Dictionary containing processing statistics
-        """
-        return {
+    def get_processing_stats(self) -> Dict:
+        """Get processing statistics"""
+        stats_dict = {
             'slides_processed': self.stats.slides_processed,
             'text_elements_found': len(self.text_elements),
             'text_elements_translated': self.stats.text_elements_translated,
@@ -570,6 +485,7 @@ class PPTXProcessor(LoggerMixin):
             'errors_encountered': self.stats.errors_encountered,
             'processing_time': self.stats.processing_time
         }
+        return stats_dict
     
     def close(self) -> None:
         """Clean up resources"""

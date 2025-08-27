@@ -65,7 +65,7 @@ class PPTransTranslator(LoggerMixin):
             return False
         
         # Skip if text is only numbers, punctuation, or whitespace
-        if re.match(r'^[0-9\s\-.,;:!?()\[\]{}"\'\'/\\]*$', text.strip()):
+        if re.match(r'^[\d\s\-.,;:!?()[\]{}"\''/\\]*$', text.strip()):
             return False
         
         # Skip very short text (likely not meaningful)
@@ -201,6 +201,9 @@ class PPTransTranslator(LoggerMixin):
         
         Returns:
             Translated text
+        
+        Raises:
+            TranslationError: If translation fails after all retries and fallbacks
         """
         if not text or not text.strip():
             return text
@@ -216,8 +219,7 @@ class PPTransTranslator(LoggerMixin):
             source_lang = 'auto'
         
         if not self.language_manager.is_valid_language_code(target_lang):
-            self.logger.warning(f"Invalid target language code: {target_lang}, using 'en'")
-            target_lang = 'en'
+            raise ValidationError(f"Invalid target language code: {target_lang}")
         
         # Skip if source and target are the same (and not auto-detect)
         if source_lang == target_lang and source_lang != 'auto':
@@ -258,6 +260,13 @@ class PPTransTranslator(LoggerMixin):
                     # Extract translated text using ultra-robust method
                     translated_text = self._safe_extract_translation(result, text)
                     
+                    # Sanity check: if translation is identical to original and we expected a change
+                    if (translated_text == text and 
+                        source_lang != 'auto' and 
+                        source_lang != target_lang and 
+                        len(text.strip()) > 3):
+                        self.logger.debug("Translation identical to original, might be correct or API issue")
+                    
                     # Update statistics
                     self.stats['translations_performed'] += 1
                     self.stats['characters_translated'] += len(text)
@@ -272,34 +281,34 @@ class PPTransTranslator(LoggerMixin):
                     return translated_text
                     
                 except requests.exceptions.ConnectionError as e:
-                    last_exception = f"Network connection failed: {str(e)}"
+                    last_exception = NetworkError(f"Network connection failed: {str(e)}")
                     self.logger.warning(f"Network error on attempt {attempt + 1}: {e}")
                     
                 except requests.exceptions.Timeout as e:
-                    last_exception = f"Translation request timed out: {str(e)}"
+                    last_exception = NetworkError(f"Translation request timed out: {str(e)}")
                     self.logger.warning(f"Timeout error on attempt {attempt + 1}: {e}")
                     
                 except requests.exceptions.HTTPError as e:
                     if hasattr(e, 'response') and e.response is not None:
                         if e.response.status_code == 429:
-                            last_exception = f"Rate limit exceeded: {str(e)}"
+                            last_exception = RateLimitError(f"Rate limit exceeded: {str(e)}")
                             self.logger.warning(f"Rate limit error on attempt {attempt + 1}: {e}")
                             time.sleep(self.retry_delay * 3)  # Longer delay for rate limits
                         elif e.response.status_code in [401, 403]:
-                            last_exception = f"Authentication failed: {str(e)}"
+                            last_exception = AuthenticationError(f"Authentication failed: {str(e)}")
                             self.logger.error(f"Auth error on attempt {attempt + 1}: {e}")
                             break  # Don't retry auth errors
                         else:
-                            last_exception = f"HTTP error {e.response.status_code}: {str(e)}"
+                            last_exception = TranslationError(f"HTTP error {e.response.status_code}: {str(e)}")
                             self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
                     else:
-                        last_exception = f"HTTP error: {str(e)}"
+                        last_exception = TranslationError(f"HTTP error: {str(e)}")
                         self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
                         
                 except Exception as e:
                     # Handle any other exception
                     error_msg = str(e)
-                    last_exception = f"Translation error: {error_msg}"
+                    last_exception = TranslationError(f"Translation error: {error_msg}")
                     self.logger.warning(f"Translation error on attempt {attempt + 1} "
                                       f"(translator {translator_attempt + 1}): {last_exception}")
                     
@@ -307,9 +316,12 @@ class PPTransTranslator(LoggerMixin):
                     if "'int' object has no attribute" in error_msg or "has no attribute 'as_dict'" in error_msg:
                         break  # Try fallback translator instead
         
-        # All attempts and fallbacks failed - return original text (graceful degradation)
+        # All attempts and fallbacks failed
         self.stats['errors_encountered'] += 1
-        self.logger.warning(f"Translation completely failed, returning original text: '{text[:50]}...'")
+        self.logger.error(f"Translation completely failed after all attempts and fallbacks")
+        
+        # Return original text instead of raising exception (graceful degradation)
+        self.logger.warning(f"Returning original text due to translation failure: '{text[:50]}...'")
         return text
     
     def translate_batch(

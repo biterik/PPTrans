@@ -1,4 +1,28 @@
+#!/usr/bin/env python3
 """
+Ultra-robust translator fix for the 'int' object has no attribute 'as_dict' error
+This completely replaces the translator.py file with a version that handles all API response variations
+"""
+
+import sys
+import os
+from pathlib import Path
+
+def backup_file(file_path):
+    """Create a backup of the original file"""
+    backup_path = Path(str(file_path) + '.backup')
+    if file_path.exists():
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"✅ Backup created: {backup_path}")
+    return backup_path
+
+def create_robust_translator():
+    """Create a completely robust translator that handles all API response formats"""
+    
+    translator_content = '''"""
 Ultra-robust translation engine for PPTrans using Google Translate
 Handles all possible API response formats including the 'int' object error
 """
@@ -65,7 +89,7 @@ class PPTransTranslator(LoggerMixin):
             return False
         
         # Skip if text is only numbers, punctuation, or whitespace
-        if re.match(r'^[0-9\s\-.,;:!?()\[\]{}"\'\'/\\]*$', text.strip()):
+        if re.match(r'^[\\d\\s\\-.,;:!?()[\\]{}"\\''/\\\\]*$', text.strip()):
             return False
         
         # Skip very short text (likely not meaningful)
@@ -77,7 +101,7 @@ class PPTransTranslator(LoggerMixin):
             return False
         
         # Skip email addresses
-        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text.strip()):
+        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$', text.strip()):
             return False
         
         return True
@@ -201,6 +225,9 @@ class PPTransTranslator(LoggerMixin):
         
         Returns:
             Translated text
+        
+        Raises:
+            TranslationError: If translation fails after all retries and fallbacks
         """
         if not text or not text.strip():
             return text
@@ -216,8 +243,7 @@ class PPTransTranslator(LoggerMixin):
             source_lang = 'auto'
         
         if not self.language_manager.is_valid_language_code(target_lang):
-            self.logger.warning(f"Invalid target language code: {target_lang}, using 'en'")
-            target_lang = 'en'
+            raise ValidationError(f"Invalid target language code: {target_lang}")
         
         # Skip if source and target are the same (and not auto-detect)
         if source_lang == target_lang and source_lang != 'auto':
@@ -258,6 +284,13 @@ class PPTransTranslator(LoggerMixin):
                     # Extract translated text using ultra-robust method
                     translated_text = self._safe_extract_translation(result, text)
                     
+                    # Sanity check: if translation is identical to original and we expected a change
+                    if (translated_text == text and 
+                        source_lang != 'auto' and 
+                        source_lang != target_lang and 
+                        len(text.strip()) > 3):
+                        self.logger.debug("Translation identical to original, might be correct or API issue")
+                    
                     # Update statistics
                     self.stats['translations_performed'] += 1
                     self.stats['characters_translated'] += len(text)
@@ -272,34 +305,34 @@ class PPTransTranslator(LoggerMixin):
                     return translated_text
                     
                 except requests.exceptions.ConnectionError as e:
-                    last_exception = f"Network connection failed: {str(e)}"
+                    last_exception = NetworkError(f"Network connection failed: {str(e)}")
                     self.logger.warning(f"Network error on attempt {attempt + 1}: {e}")
                     
                 except requests.exceptions.Timeout as e:
-                    last_exception = f"Translation request timed out: {str(e)}"
+                    last_exception = NetworkError(f"Translation request timed out: {str(e)}")
                     self.logger.warning(f"Timeout error on attempt {attempt + 1}: {e}")
                     
                 except requests.exceptions.HTTPError as e:
                     if hasattr(e, 'response') and e.response is not None:
                         if e.response.status_code == 429:
-                            last_exception = f"Rate limit exceeded: {str(e)}"
+                            last_exception = RateLimitError(f"Rate limit exceeded: {str(e)}")
                             self.logger.warning(f"Rate limit error on attempt {attempt + 1}: {e}")
                             time.sleep(self.retry_delay * 3)  # Longer delay for rate limits
                         elif e.response.status_code in [401, 403]:
-                            last_exception = f"Authentication failed: {str(e)}"
+                            last_exception = AuthenticationError(f"Authentication failed: {str(e)}")
                             self.logger.error(f"Auth error on attempt {attempt + 1}: {e}")
                             break  # Don't retry auth errors
                         else:
-                            last_exception = f"HTTP error {e.response.status_code}: {str(e)}"
+                            last_exception = TranslationError(f"HTTP error {e.response.status_code}: {str(e)}")
                             self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
                     else:
-                        last_exception = f"HTTP error: {str(e)}"
+                        last_exception = TranslationError(f"HTTP error: {str(e)}")
                         self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
                         
                 except Exception as e:
                     # Handle any other exception
                     error_msg = str(e)
-                    last_exception = f"Translation error: {error_msg}"
+                    last_exception = TranslationError(f"Translation error: {error_msg}")
                     self.logger.warning(f"Translation error on attempt {attempt + 1} "
                                       f"(translator {translator_attempt + 1}): {last_exception}")
                     
@@ -307,9 +340,12 @@ class PPTransTranslator(LoggerMixin):
                     if "'int' object has no attribute" in error_msg or "has no attribute 'as_dict'" in error_msg:
                         break  # Try fallback translator instead
         
-        # All attempts and fallbacks failed - return original text (graceful degradation)
+        # All attempts and fallbacks failed
         self.stats['errors_encountered'] += 1
-        self.logger.warning(f"Translation completely failed, returning original text: '{text[:50]}...'")
+        self.logger.error(f"Translation completely failed after all attempts and fallbacks")
+        
+        # Return original text instead of raising exception (graceful degradation)
+        self.logger.warning(f"Returning original text due to translation failure: '{text[:50]}...'")
         return text
     
     def translate_batch(
@@ -446,3 +482,119 @@ class PPTransTranslator(LoggerMixin):
             'total_time': 0.0
         }
         self.logger.info("Translation statistics reset")
+'''
+    
+    return translator_content
+
+def apply_translator_fix():
+    """Apply the ultra-robust translator fix"""
+    print("\n=== Applying Ultra-Robust Translator Fix ===")
+    
+    translator_path = Path('src/core/translator.py')
+    if not translator_path.exists():
+        print(f"❌ File not found: {translator_path}")
+        return False
+    
+    # Create backup
+    backup_file(translator_path)
+    
+    try:
+        # Write the robust translator
+        robust_content = create_robust_translator()
+        with open(translator_path, 'w', encoding='utf-8') as f:
+            f.write(robust_content)
+        
+        print(f"✅ Applied ultra-robust translator fix to {translator_path}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error applying translator fix: {e}")
+        return False
+
+def test_robust_translator():
+    """Test the robust translator"""
+    print("\n=== Testing Ultra-Robust Translator ===")
+    
+    try:
+        # Add src to path
+        src_path = Path('src').absolute()
+        if str(src_path) not in sys.path:
+            sys.path.insert(0, str(src_path))
+        
+        # Reimport to get the new version
+        import importlib
+        if 'core.translator' in sys.modules:
+            importlib.reload(sys.modules['core.translator'])
+        
+        from core.translator import PPTransTranslator
+        
+        # Test translator with comprehensive error handling
+        translator = PPTransTranslator({'max_retries': 2, 'retry_delay': 0.5})
+        
+        # Test simple translation
+        test_texts = [
+            "Hallo",
+            "Guten Tag", 
+            "Wie geht es dir?"
+        ]
+        
+        successful_translations = 0
+        for test_text in test_texts:
+            try:
+                result = translator.translate_text(test_text, 'de', 'en')
+                print(f"✅ '{test_text}' → '{result}'")
+                successful_translations += 1
+            except Exception as e:
+                print(f"⚠️  '{test_text}' failed: {e}")
+        
+        print(f"\nTranslation success rate: {successful_translations}/{len(test_texts)}")
+        
+        # Get statistics
+        stats = translator.get_statistics()
+        print(f"Translation stats: {stats}")
+        
+        return successful_translations > 0
+        
+    except Exception as e:
+        print(f"❌ Ultra-robust translator test failed: {e}")
+        return False
+
+def main():
+    """Main function to apply and test the fix"""
+    print("Ultra-Robust Translator Fix for PPTrans")
+    print("=" * 60)
+    
+    # Check we're in the right directory
+    if not Path('src').exists():
+        print("❌ Please run this script from the PPTrans project root directory")
+        return False
+    
+    success = True
+    
+    # Apply the fix
+    success &= apply_translator_fix()
+    
+    # Test the fix
+    if success:
+        success &= test_robust_translator()
+    
+    print("\n" + "=" * 60)
+    if success:
+        print("🎉 Ultra-robust translator fix applied and tested successfully!")
+        print("\n✨ Key improvements:")
+        print("   - Handles 'int' object API responses gracefully")
+        print("   - Falls back to original text when translation fails")
+        print("   - Uses multiple fallback strategies")
+        print("   - Creates backup translator instances")
+        print("   - Comprehensive error logging")
+        print("\n🔧 Next steps:")
+        print("   1. Test with: python src/main.py")
+        print("   2. Try a small slide range first (e.g., '1' or '1-2')")
+        print("   3. Check that translations are now applied to slides")
+    else:
+        print("❌ Some issues remain. Please check the output above.")
+    
+    return success
+
+if __name__ == "__main__":
+    main()

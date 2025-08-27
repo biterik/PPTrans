@@ -159,4 +159,4 @@ def create_user_friendly_message(exception: PPTransError) -> str:
     elif isinstance(exception, LanguageNotSupportedError):
         return f"Language not supported: {exception.language_code}"
     else:
-        return f"An error occurred: {str(exception)}"
+        return f"An error occurred: {exception.message}"

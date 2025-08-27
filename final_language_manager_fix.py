@@ -1,4 +1,93 @@
+#!/usr/bin/env python3
 """
+Final LanguageManager fix with correct method parameters that match GUI expectations
+"""
+
+import sys
+import os
+from pathlib import Path
+
+def fix_get_language_list_method():
+    """Fix the get_language_list method to match GUI expectations"""
+    
+    lang_mgr_path = Path('src/core/language_manager.py')
+    if not lang_mgr_path.exists():
+        print(f"❌ File not found: {lang_mgr_path}")
+        return False
+    
+    # Read current content
+    with open(lang_mgr_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Find and replace the get_language_list method
+    old_method = '''    def get_language_list(self, popular_first: bool = False) -> List[Tuple[str, str]]:
+        """
+        Get list of languages formatted for GUI dropdowns
+        This is the method the GUI is looking for!
+        
+        Args:
+            popular_first: If True, put popular languages first
+            
+        Returns:
+            List of tuples (language_code, language_name)
+        """'''
+    
+    new_method = '''    def get_language_list(self, include_auto_detect: bool = True, popular_first: bool = False) -> List[Tuple[str, str]]:
+        """
+        Get list of languages formatted for GUI dropdowns
+        This is the method the GUI is looking for!
+        
+        Args:
+            include_auto_detect: If True, include "Auto-detect" option at the top
+            popular_first: If True, put popular languages first
+            
+        Returns:
+            List of tuples (language_code, language_name)
+        """
+        result = []
+        
+        # Add auto-detect option if requested
+        if include_auto_detect:
+            result.append(("auto", "Auto-detect"))'''
+    
+    # Replace the method definition
+    if old_method in content:
+        # Replace method signature and add the auto-detect logic
+        content = content.replace(old_method, new_method)
+        
+        # Also need to update the method body to handle the auto-detect logic
+        old_body_start = '''        if popular_first:'''
+        new_body_start = '''        
+        if popular_first:'''
+        
+        content = content.replace(old_body_start, new_body_start)
+        
+        # Update the return statements to use result list
+        content = content.replace(
+            'return popular_langs + remaining_langs',
+            'result.extend(popular_langs + remaining_langs)\n            return result'
+        )
+        content = content.replace(
+            'return all_langs',
+            'result.extend(all_langs)\n            return result'
+        )
+        
+        try:
+            with open(lang_mgr_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"✅ Fixed get_language_list method in {lang_mgr_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error writing file: {e}")
+            return False
+    else:
+        print("❌ Could not find method to replace")
+        return False
+
+def create_quick_complete_fix():
+    """Create a complete working language manager with the correct method signature"""
+    
+    content = '''"""
 Complete Language manager for PPTrans with all GUI-required methods
 Final version with correct method signatures
 """
@@ -329,3 +418,115 @@ class LanguageManager(LoggerMixin):
             return f"{name.title()} ({code})"
         else:
             return code  # Fallback to just the code
+'''
+    
+    return content
+
+def apply_final_fix():
+    """Apply the final complete fix"""
+    print("\n=== Applying Final LanguageManager Fix ===")
+    
+    lang_mgr_path = Path('src/core/language_manager.py')
+    if not lang_mgr_path.exists():
+        print(f"❌ File not found: {lang_mgr_path}")
+        return False
+    
+    # Create backup
+    backup_path = Path(str(lang_mgr_path) + '.backup_final')
+    if lang_mgr_path.exists():
+        with open(lang_mgr_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"✅ Backup created: {backup_path}")
+    
+    try:
+        # Write the complete final language manager
+        final_content = create_quick_complete_fix()
+        with open(lang_mgr_path, 'w', encoding='utf-8') as f:
+            f.write(final_content)
+        
+        print(f"✅ Applied final LanguageManager fix to {lang_mgr_path}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error applying final fix: {e}")
+        return False
+
+def test_final_language_manager():
+    """Test the final language manager"""
+    print("\n=== Testing Final LanguageManager ===")
+    
+    try:
+        # Add src to path
+        src_path = Path('src').absolute()
+        if str(src_path) not in sys.path:
+            sys.path.insert(0, str(src_path))
+        
+        # Reimport to get the new version
+        import importlib
+        if 'core.language_manager' in sys.modules:
+            importlib.reload(sys.modules['core.language_manager'])
+        
+        from core.language_manager import LanguageManager
+        
+        # Test the language manager
+        lang_mgr = LanguageManager()
+        print(f"✅ LanguageManager loaded with {len(lang_mgr.get_all_languages())} languages")
+        
+        # Test the method with the correct parameters that the GUI uses
+        source_languages = lang_mgr.get_language_list(include_auto_detect=True, popular_first=True)
+        print(f"✅ get_language_list(include_auto_detect=True, popular_first=True): {len(source_languages)} languages")
+        print(f"   First few: {source_languages[:3]}")
+        
+        target_languages = lang_mgr.get_language_list(include_auto_detect=False, popular_first=True)  
+        print(f"✅ get_language_list(include_auto_detect=False, popular_first=True): {len(target_languages)} languages")
+        print(f"   First few: {target_languages[:3]}")
+        
+        # Test validation
+        print(f"✅ is_valid_language_code('auto'): {lang_mgr.is_valid_language_code('auto')}")
+        print(f"✅ is_valid_language_code('en'): {lang_mgr.is_valid_language_code('en')}")
+        print(f"✅ is_valid_language_code('de'): {lang_mgr.is_valid_language_code('de')}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Final LanguageManager test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def main():
+    """Main function to apply and test the final fix"""
+    print("Final LanguageManager Fix for PPTrans GUI")
+    print("=" * 50)
+    
+    # Check we're in the right directory
+    if not Path('src').exists():
+        print("❌ Please run this script from the PPTrans project root directory")
+        return False
+    
+    success = True
+    
+    # Apply the final fix
+    success &= apply_final_fix()
+    
+    # Test the final fix
+    if success:
+        success &= test_final_language_manager()
+    
+    print("\n" + "=" * 50)
+    if success:
+        print("🎉 Final LanguageManager fix applied and tested!")
+        print("\n✨ Fixed method signature:")
+        print("   get_language_list(include_auto_detect=True, popular_first=False)")
+        print("\n🔧 Next step:")
+        print("   Test the GUI: python src/main.py")
+        print("   Should launch without LanguageManager errors!")
+    else:
+        print("❌ Some issues remain. Please check the output above.")
+    
+    return success
+
+if __name__ == "__main__":
+    main()
