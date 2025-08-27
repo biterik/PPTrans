@@ -1,580 +1,492 @@
 """
-PowerPoint processor for PPTrans - Complete working version
-Handles PPTX file manipulation with proper type handling and all required methods
+PPTX Processor with FIXED text distribution - no more text corruption
 """
-
 import os
-import shutil
-import re
-from datetime import datetime
-from typing import List, Dict, Optional, Union, Any
+import html  # Add this import for HTML entity decoding
 from pathlib import Path
-
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from pptx import Presentation
-from pptx.util import Pt
 from pptx.enum.text import PP_ALIGN
-
-from utils.logger import LoggerMixin, log_performance
-
-
-class ProcessingStats:
-    """Statistics for processing operations"""
-    
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        """Reset all statistics"""
-        self.slides_processed = 0
-        self.text_elements_found = 0
-        self.text_elements_translated = 0
-        self.text_elements_skipped = 0
-        self.errors_encountered = 0
-        self.processing_time = 0.0
-        self.start_time = None
-        self.end_time = None
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
+from utils.logger import LoggerMixin
+from utils.exceptions import ValidationError, PPTXProcessingError
 
 
 class PPTXProcessor(LoggerMixin):
-    """PowerPoint presentation processor with translation capabilities"""
+    """PowerPoint processor optimized for batch translation with FIXED text distribution"""
     
-    def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize PPTX processor
-        
-        Args:
-            config: Configuration dictionary
-        """
-        self.config = config or {}
-        self.preserve_animations = self.config.get('preserve_animations', True)
-        self.backup_original = self.config.get('backup_original', True)
-        self.parallel_processing = self.config.get('parallel_processing', False)
-        self.max_workers = self.config.get('max_workers', 4)
-        
-        # Current state
-        self.current_presentation = None
-        self.current_file_path = None
+    def __init__(self, advanced_settings: dict):
+        """Initialize with advanced settings from config"""
+        self.settings = advanced_settings
+        self.presentation = None
+        self.current_file = None
         self.text_elements = []
-        self.stats = ProcessingStats()
+        self.processing_stats = {
+            'total_slides': 0,
+            'processed_slides': 0,
+            'text_elements_found': 0,
+            'translated_elements': 0,
+            'skipped_elements': 0,
+            'error_count': 0
+        }
         
-        self.logger.info(f"PPTX Processor initialized with config: {self.config}")
-    
-    def load_presentation(self, file_path: Union[str, Path]) -> None:
-        """
-        Load a PowerPoint presentation
+        self.logger.info("FIXED Batch-enabled PPTXProcessor initialized")
         
-        Args:
-            file_path: Path to the PPTX file
+    def load_presentation(self, file_path: str):
+        """Load the PowerPoint presentation"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"PowerPoint file not found: {file_path}")
             
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            ValueError: If file is not a valid PPTX
-            RuntimeError: If loading fails
-        """
-        file_path = Path(file_path)
-        
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        if not file_path.suffix.lower() == '.pptx':
-            raise ValueError(f"File is not a PowerPoint presentation: {file_path}")
-        
         try:
-            self.logger.info(f"Loading presentation: {file_path}")
-            
-            # Create backup if requested
-            if self.backup_original:
-                backup_path = file_path.with_suffix(f'{file_path.suffix}.backup')
-                shutil.copy2(file_path, backup_path)
-                self.logger.info(f"Created backup: {backup_path}")
-            
-            # Load the presentation
-            self.current_presentation = Presentation(str(file_path))
-            self.current_file_path = file_path
-            
-            # Reset processing state
-            self.text_elements = []
-            self.stats.reset()
-            
-            slide_count = len(self.current_presentation.slides)
-            self.logger.info(f"Presentation loaded successfully: {slide_count} slides")
-            
+            self.current_file = file_path
+            self.presentation = Presentation(file_path)
+            self.processing_stats['total_slides'] = len(self.presentation.slides)
+            self.logger.info(f"Loaded presentation with {self.processing_stats['total_slides']} slides")
         except Exception as e:
-            raise RuntimeError(f"Failed to load presentation: {str(e)}")
-    
-    def get_slide_count(self) -> int:
-        """Get the number of slides in the current presentation"""
-        if not self.current_presentation:
-            return 0
-        return len(self.current_presentation.slides)
+            self.logger.error(f"Failed to load presentation: {e}")
+            raise PPTXProcessingError(f"Cannot load PowerPoint file: {e}", file_path=file_path)
     
     def get_presentation_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current presentation
+        """Get presentation information"""
+        if not self.presentation:
+            return {'total_slides': 0}
         
-        Returns:
-            Dictionary containing presentation metadata
-        """
-        if not self.current_presentation or not self.current_file_path:
-            return {}
-        
-        try:
-            file_path = Path(self.current_file_path)
-            slide_count = len(self.current_presentation.slides)
-            
-            # Get file statistics
-            stat = file_path.stat()
-            file_size = stat.st_size
-            modified_time = datetime.fromtimestamp(stat.st_mtime)
-            
-            # Format file size
-            if file_size < 1024:
-                size_str = f"{file_size} bytes"
-            elif file_size < 1024 * 1024:
-                size_str = f"{file_size / 1024:.1f} KB"
-            else:
-                size_str = f"{file_size / (1024 * 1024):.1f} MB"
-            
-            info = {
-                'filename': file_path.name,
-                'filepath': str(file_path),
-                'slide_count': slide_count,
-                'file_size': file_size,
-                'file_size_formatted': size_str,
-                'modified': modified_time,
-                'modified_formatted': modified_time.strftime('%Y-%m-%d %H:%M:%S')
-            }
-            
-            # Try to get presentation core properties
-            try:
-                core_props = self.current_presentation.core_properties
-                if hasattr(core_props, 'title') and core_props.title:
-                    info['title'] = core_props.title
-                if hasattr(core_props, 'author') and core_props.author:
-                    info['author'] = core_props.author
-                if hasattr(core_props, 'subject') and core_props.subject:
-                    info['subject'] = core_props.subject
-            except Exception:
-                pass  # Core properties not available or accessible
-            
-            return info
-            
-        except Exception as e:
-            self.logger.warning(f"Could not extract presentation info: {e}")
-            return {'error': str(e)}
+        return {
+            'total_slides': len(self.presentation.slides),
+            'file_path': self.current_file
+        }
     
-    def parse_slide_range(self, range_str: str) -> List[int]:
-        """
-        Parse slide range string and return list of slide indices (0-based)
+    def parse_slide_range(self, slide_range: str) -> List[int]:
+        """Parse slide range specification into list of slide indices"""
+        if not self.presentation:
+            raise PPTXProcessingError("No presentation loaded")
         
-        Args:
-            range_str: Range specification string (e.g., "1-5", "1,3,5", "all")
-            
-        Returns:
-            List of 0-based slide indices (guaranteed to be integers)
-            
-        Raises:
-            ValueError: If range specification is invalid
-        """
-        if not range_str or not range_str.strip():
-            raise ValueError("Empty slide range specification")
+        total_slides = len(self.presentation.slides)
         
-        range_str = str(range_str).strip().lower()  # Ensure string type
-        max_slides = self.get_slide_count()
+        if slide_range.lower() == 'all':
+            return list(range(total_slides))
         
-        if max_slides == 0:
-            raise ValueError("No presentation loaded")
+        indices = []
+        parts = slide_range.split(',')
         
-        # Handle "all" keyword
-        if range_str == "all":
-            return list(range(max_slides))
-        
-        # Clean input: keep only digits, hyphens, and commas
-        cleaned = re.sub(r'[^0-9\-,]', '', range_str)
-        
-        if not cleaned:
-            raise ValueError(f"Invalid slide range specification: '{range_str}' - no valid numbers found")
-        
-        slide_indices = set()
-        
-        try:
-            # Split by commas
-            parts = [part.strip() for part in cleaned.split(',') if part.strip()]
-            
-            for part in parts:
-                if '-' in part:
-                    # Handle range like "5-10"
-                    range_parts = part.split('-')
-                    if len(range_parts) != 2:
-                        raise ValueError(f"Invalid range format: '{part}' - expected 'start-end'")
-                    
-                    start_str, end_str = range_parts
-                    if not start_str or not end_str:
-                        raise ValueError(f"Invalid range format: '{part}' - missing start or end")
-                    
-                    # Convert to integers
-                    start = int(start_str)
-                    end = int(end_str)
-                    
-                    # Validate range
-                    if start < 1 or end < 1:
-                        raise ValueError(f"Slide numbers must be positive, got {start}-{end}")
-                    
-                    if start > end:
-                        raise ValueError(f"Invalid range: start ({start}) > end ({end})")
-                    
-                    if start > max_slides or end > max_slides:
-                        raise ValueError(f"Slide range {start}-{end} exceeds available slides (1-{max_slides})")
-                    
-                    # Add all slides in range (convert to 0-based indexing)
-                    for slide_num in range(start - 1, end):
-                        slide_indices.add(int(slide_num))  # Ensure integer
-                    
-                else:
-                    # Handle single slide
-                    slide_num = int(part)
-                    if slide_num < 1:
-                        raise ValueError(f"Slide number must be positive, got {slide_num}")
-                    if slide_num > max_slides:
-                        raise ValueError(f"Slide {slide_num} exceeds available slides (1-{max_slides})")
-                    
-                    # Convert to 0-based indexing and ensure integer
-                    slide_indices.add(int(slide_num - 1))
-        
-        except ValueError as ve:
-            raise ve  # Re-raise ValueError as-is
-        except Exception as e:
-            raise ValueError(f"Error parsing slide range '{range_str}': {str(e)}")
-        
-        if not slide_indices:
-            raise ValueError(f"No valid slides specified in range: {range_str}")
-        
-        # Convert to sorted list of integers
-        result = sorted([int(idx) for idx in slide_indices])
-        
-        # Double-check all elements are integers
-        assert all(isinstance(idx, int) for idx in result), "Result contains non-integer values"
-        
-        return result
-    
-    def extract_text_elements(self, slide_indices: List[int]) -> List[Dict]:
-        """
-        Extract text elements from specified slides
-        
-        Args:
-            slide_indices: List of slide indices (0-based) - must be integers
-            
-        Returns:
-            List of text element dictionaries
-        """
-        if not self.current_presentation:
-            raise ValueError("No presentation loaded")
-        
-        # Ensure slide_indices are integers
-        slide_indices = [int(idx) for idx in slide_indices]
-        
-        # Create display list for logging (1-based)
-        display_slides = [idx + 1 for idx in slide_indices]
-        self.logger.info(f"Extracting text from slides: {display_slides}")
-        
-        text_elements = []
-        
-        for slide_idx in slide_indices:
-            if slide_idx >= len(self.current_presentation.slides):
-                self.logger.warning(f"Slide index {slide_idx} exceeds available slides")
+        for part in parts:
+            part = part.strip()
+            if not part:
                 continue
             
-            slide = self.current_presentation.slides[slide_idx]
-            
-            # Process each shape in the slide
-            for shape_idx, shape in enumerate(slide.shapes):
+            if '-' in part:
                 try:
-                    if not hasattr(shape, 'text_frame') or not shape.text_frame:
-                        continue
+                    start_str, end_str = part.split('-', 1)
+                    start = int(start_str.strip()) - 1  # Convert to 0-based
+                    end = int(end_str.strip()) - 1      # Convert to 0-based
                     
-                    text_frame = shape.text_frame
+                    # Validate range
+                    start = max(0, min(start, total_slides - 1))
+                    end = max(0, min(end, total_slides - 1))
                     
-                    # Process each paragraph
-                    for para_idx, paragraph in enumerate(text_frame.paragraphs):
-                        # Collect text from all runs in the paragraph
-                        paragraph_text = ""
-                        formatting_info = {}
+                    if start <= end:
+                        indices.extend(range(start, end + 1))
+                    else:
+                        indices.extend(range(end, start + 1))
                         
-                        for run in paragraph.runs:
-                            if run.text.strip():
-                                paragraph_text += run.text
-                                
-                                # Capture formatting from first run with content
-                                if not formatting_info and run.text.strip():
-                                    formatting_info = self._extract_formatting(run, paragraph)
-                        
-                        # Only add if there's actual text content
-                        if paragraph_text.strip():
-                            text_element = {
-                                'slide_index': int(slide_idx),  # Ensure integer
-                                'shape_index': int(shape_idx),  # Ensure integer
-                                'paragraph_index': int(para_idx),  # Ensure integer
-                                'original_text': paragraph_text,
-                                'translated_text': '',
-                                'formatting': formatting_info,
-                                'shape_reference': shape
-                            }
-                            
-                            text_elements.append(text_element)
-                
-                except Exception as e:
-                    self.logger.warning(f"Error processing shape {shape_idx} on slide {slide_idx + 1}: {e}")
+                except ValueError as e:
+                    self.logger.error(f"Invalid range format: {part}")
+                    continue
+            else:
+                try:
+                    slide_num = int(part) - 1  # Convert to 0-based
+                    if 0 <= slide_num < total_slides:
+                        indices.append(slide_num)
+                except ValueError:
+                    self.logger.error(f"Invalid slide number: {part}")
                     continue
         
-        self.text_elements = text_elements
-        self.logger.info(f"Extracted {len(text_elements)} text elements from {len(slide_indices)} slides")
-        
-        return text_elements
+        # Remove duplicates and sort
+        indices = sorted(list(set(indices)))
+        self.logger.debug(f"Parsed slide range '{slide_range}' to indices: {indices}")
+        return indices
     
-    def _extract_formatting(self, run, paragraph) -> Dict:
-        """
-        Extract formatting information from a text run and paragraph
-        
-        Args:
-            run: Text run object
-            paragraph: Paragraph object
-            
-        Returns:
-            Dictionary containing formatting information
-        """
+    def _extract_run_formatting(self, run) -> Dict[str, Any]:
+        """Extract all formatting information from a text run"""
         formatting = {}
         
         try:
-            # Extract run-level formatting
             if hasattr(run, 'font'):
                 font = run.font
                 
+                # Font name
                 if hasattr(font, 'name') and font.name:
                     formatting['font_name'] = font.name
                 
+                # Font size
                 if hasattr(font, 'size') and font.size:
                     formatting['font_size'] = font.size.pt
                 
+                # Bold, italic, underline
                 formatting['bold'] = font.bold if font.bold is not None else False
                 formatting['italic'] = font.italic if font.italic is not None else False
                 formatting['underline'] = font.underline if font.underline is not None else False
                 
-                # Try to extract font color
+                # Font color
                 try:
                     if hasattr(font, 'color') and font.color and hasattr(font.color, 'rgb'):
                         rgb = font.color.rgb
-                        formatting['font_color'] = (rgb.r, rgb.g, rgb.b)
+                        if rgb:
+                            formatting['font_color'] = (rgb.r, rgb.g, rgb.b)
                 except Exception:
                     pass  # Color extraction can fail
-            
-            # Extract paragraph-level formatting
+                    
+        except Exception as e:
+            self.logger.debug(f"Error extracting run formatting: {e}")
+        
+        return formatting
+    
+    def _extract_paragraph_formatting(self, paragraph) -> Dict[str, Any]:
+        """Extract paragraph-level formatting"""
+        formatting = {}
+        
+        try:
+            # Paragraph alignment
             if hasattr(paragraph, 'alignment') and paragraph.alignment is not None:
                 alignment_map = {
                     PP_ALIGN.LEFT: 'left',
-                    PP_ALIGN.CENTER: 'center',
+                    PP_ALIGN.CENTER: 'center', 
                     PP_ALIGN.RIGHT: 'right',
                     PP_ALIGN.JUSTIFY: 'justify'
                 }
                 formatting['alignment'] = alignment_map.get(paragraph.alignment, 'left')
             
+            # Space before/after
+            if hasattr(paragraph, 'space_before') and paragraph.space_before:
+                formatting['space_before'] = paragraph.space_before.pt
+                
+            if hasattr(paragraph, 'space_after') and paragraph.space_after:
+                formatting['space_after'] = paragraph.space_after.pt
+                
         except Exception as e:
-            self.logger.debug(f"Error extracting formatting: {e}")
+            self.logger.debug(f"Error extracting paragraph formatting: {e}")
         
         return formatting
     
-    @log_performance
-    def translate_elements(self, translator, source_lang: str = 'auto', target_lang: str = 'en') -> None:
+    def extract_text_elements(self, slide_range: str = "all") -> List[Dict[str, Any]]:
         """
-        Translate all extracted text elements
-        
-        Args:
-            translator: Translation service instance
-            source_lang: Source language code
-            target_lang: Target language code
+        Extract text elements from specified slides with smart grouping for batch translation
         """
-        if not self.text_elements:
-            raise ValueError("No text elements to translate")
+        if not self.presentation:
+            raise PPTXProcessingError("No presentation loaded")
         
-        self.logger.info(f"Starting translation of {len(self.text_elements)} text elements")
+        slide_indices = self.parse_slide_range(slide_range)
+        self.text_elements = []
+        element_id = 0
         
-        successful_translations = 0
-        failed_translations = 0
+        self.logger.info(f"Extracting text from slides: {[i+1 for i in slide_indices]}")
         
-        for i, element in enumerate(self.text_elements):
+        for slide_idx in slide_indices:
             try:
-                original_text = element['original_text']
-                if not original_text.strip():
-                    element['translated_text'] = original_text
-                    continue
+                slide = self.presentation.slides[slide_idx]
+                slide_elements = 0
                 
-                # Translate the text
-                translated_text = translator.translate_text(
-                    original_text,
-                    source_lang=source_lang,
-                    target_lang=target_lang
-                )
+                for shape_idx, shape in enumerate(slide.shapes):
+                    if hasattr(shape, 'text_frame') and shape.text_frame:
+                        text_frame = shape.text_frame
+                        
+                        # Group by paragraph for better context in batch translation
+                        for para_idx, paragraph in enumerate(text_frame.paragraphs):
+                            if not paragraph.text.strip():
+                                continue
+                                
+                            paragraph_formatting = self._extract_paragraph_formatting(paragraph)
+                            
+                            # Collect all runs in this paragraph
+                            paragraph_runs = []
+                            paragraph_text_parts = []
+                            
+                            for run_idx, run in enumerate(paragraph.runs):
+                                if run.text:  # Include even empty runs to preserve structure
+                                    run_formatting = self._extract_run_formatting(run)
+                                    
+                                    run_data = {
+                                        'run_index': run_idx,
+                                        'text': run.text,
+                                        'formatting': run_formatting,
+                                        'run_ref': run
+                                    }
+                                    paragraph_runs.append(run_data)
+                                    paragraph_text_parts.append(run.text)
+                            
+                            if paragraph_runs:  # Only if we have runs with text
+                                # Create a paragraph-level element for batch translation
+                                element = {
+                                    'id': element_id,
+                                    'slide_index': slide_idx,
+                                    'shape_index': shape_idx,
+                                    'paragraph_index': para_idx,
+                                    'type': 'paragraph',
+                                    'original_text': ''.join(paragraph_text_parts),
+                                    'translated_text': None,
+                                    'paragraph_formatting': paragraph_formatting,
+                                    'runs': paragraph_runs,
+                                    'shape_ref': shape,
+                                    'paragraph_ref': paragraph
+                                }
+                                
+                                self.text_elements.append(element)
+                                element_id += 1
+                                slide_elements += 1
                 
-                # Store the translation
-                element['translated_text'] = translated_text
-                
-                if translated_text != original_text:
-                    successful_translations += 1
-                    self.logger.debug(f"Translated: '{original_text[:50]}...' -> '{translated_text[:50]}...'")
-                else:
-                    self.logger.debug(f"No change: '{original_text[:50]}...'")
+                self.processing_stats['processed_slides'] += 1
+                self.logger.debug(f"Slide {slide_idx + 1}: Found {slide_elements} paragraph elements")
                 
             except Exception as e:
-                self.logger.warning(f"Failed to translate element {i}: {e}")
-                element['translated_text'] = element['original_text']  # Keep original on failure
-                failed_translations += 1
+                self.logger.error(f"Error processing slide {slide_idx + 1}: {e}")
+                self.processing_stats['error_count'] += 1
         
-        self.logger.info(f"Translation completed: {len(self.text_elements)} elements translated, 0 skipped, {failed_translations} errors")
+        self.processing_stats['text_elements_found'] = len(self.text_elements)
+        self.logger.info(f"Extracted {len(self.text_elements)} paragraph elements from {len(slide_indices)} slides")
+        
+        return self.text_elements
+    
+    def _should_skip_translation(self, text: str) -> bool:
+        """Check if text should be skipped from translation (URLs, emails, etc.)"""
+        import re
+        
+        # Skip URLs
+        url_pattern = r'https?://[^\s]+'
+        if re.search(url_pattern, text):
+            return True
+        
+        # Skip if text is mostly a URL
+        if text.strip().startswith(('http://', 'https://', 'www.')):
+            return True
+            
+        return False
+    
+    def translate_text_elements(self, translate_callback: Callable[[str], str]) -> None:
+        """
+        Translate extracted text elements using batch processing
+        
+        Args:
+            translate_callback: Function that handles translation - now expects to handle batches
+        """
+        if not self.text_elements:
+            raise ValidationError("No text elements to translate")
+        
+        # Check if the translator supports batch translation
+        from core.translator import PPTransTranslator
+        translator = PPTransTranslator(self.settings.get('translation', {}))
+        
+        # Collect all text to translate
+        texts_to_translate = []
+        element_map = {}  # Map translation results back to elements
+        
+        for i, element in enumerate(self.text_elements):
+            original_text = element['original_text']
+            if original_text and original_text.strip():
+                # Skip URLs and other content that shouldn't be translated
+                if self._should_skip_translation(original_text):
+                    element['translated_text'] = original_text  # Keep original
+                    self.logger.debug(f"Skipped translation for URL/special content: '{original_text[:50]}...'")
+                    continue
+                    
+                texts_to_translate.append(original_text)
+                element_map[len(texts_to_translate) - 1] = i
+            else:
+                element['translated_text'] = original_text  # Keep empty/whitespace as is
+        
+        if not texts_to_translate:
+            self.logger.info("No text found that needs translation")
+            return
+        
+        self.logger.info(f"Starting batch translation of {len(texts_to_translate)} text elements")
+        
+        try:
+            # Use batch translation
+            translated_texts = translator.translate_text_batch(
+                texts_to_translate, 
+                source_lang='de', 
+                target_lang='en'
+            )
+            
+            # Map results back to elements
+            translated_count = 0
+            for batch_idx, translated_text in enumerate(translated_texts):
+                if batch_idx in element_map:
+                    element_idx = element_map[batch_idx]
+                    element = self.text_elements[element_idx]
+                    
+                    if translated_text and translated_text != element['original_text']:
+                        element['translated_text'] = translated_text
+                        translated_count += 1
+                        self.logger.debug(f"Translated paragraph {element['id']}: '{element['original_text'][:50]}...' -> '{translated_text[:50]}...'")
+                    else:
+                        element['translated_text'] = element['original_text']
+            
+            self.processing_stats['translated_elements'] = translated_count
+            self.processing_stats['skipped_elements'] = len(self.text_elements) - translated_count
+            
+            self.logger.info(f"Batch translation completed: {translated_count}/{len(self.text_elements)} elements translated")
+            
+        except Exception as e:
+            self.logger.error(f"Batch translation failed: {e}")
+            # Fall back to original text for all elements
+            for element in self.text_elements:
+                element['translated_text'] = element['original_text']
+            self.processing_stats['error_count'] += 1
+    
+    def _distribute_translation_to_runs(self, element: Dict[str, Any]) -> None:
+        """
+        FIXED: Simple and clean approach - put entire translation in first run, clear others
+        This prevents word fragmentation and text corruption
+        """
+        translated_text = element['translated_text']
+        runs = element['runs']
+        
+        if not translated_text or not runs:
+            return
+        
+        # Decode HTML entities first
+        translated_text = html.unescape(translated_text)
+        
+        # Simple approach: Put entire translation in the first run
+        # This preserves readability at the cost of some run-level formatting
+        if runs:
+            # Apply translation to first run
+            runs[0]['translated_text'] = translated_text
+            
+            # Clear all other runs to avoid duplication
+            for i in range(1, len(runs)):
+                runs[i]['translated_text'] = ''
+        
+        self.logger.debug(f"Distributed translation cleanly: '{translated_text[:50]}...'")
+    
+    def _apply_run_formatting(self, run, formatting: Dict[str, Any]) -> None:
+        """Apply formatting to a text run with enhanced font handling"""
+        try:
+            if hasattr(run, 'font'):
+                font = run.font
+                
+                # Apply font name with fallback for problematic fonts
+                if 'font_name' in formatting and formatting['font_name']:
+                    font_name = formatting['font_name']
+                    
+                    # Skip problematic symbol fonts
+                    problematic_fonts = ['Zapf Dingbats', 'Symbol', 'Wingdings', 'Webdings']
+                    if any(prob_font.lower() in font_name.lower() for prob_font in problematic_fonts):
+                        # Use a safe default font instead
+                        font.name = 'Calibri'
+                        self.logger.debug(f"Replaced problematic font '{font_name}' with Calibri")
+                    else:
+                        font.name = font_name
+                
+                # Apply font size
+                if 'font_size' in formatting and formatting['font_size']:
+                    try:
+                        font.size = Pt(formatting['font_size'])
+                    except Exception as size_error:
+                        self.logger.debug(f"Error setting font size: {size_error}")
+                
+                # Apply bold, italic, underline
+                if 'bold' in formatting:
+                    font.bold = formatting['bold']
+                if 'italic' in formatting:
+                    font.italic = formatting['italic']
+                if 'underline' in formatting:
+                    font.underline = formatting['underline']
+                
+                # Apply font color
+                if 'font_color' in formatting and formatting['font_color']:
+                    try:
+                        r, g, b = formatting['font_color']
+                        font.color.rgb = RGBColor(r, g, b)
+                    except Exception as color_error:
+                        self.logger.debug(f"Error setting font color: {color_error}")
+                    
+        except Exception as e:
+            self.logger.debug(f"Error applying run formatting: {e}")
+    
+    def _apply_paragraph_formatting(self, paragraph, formatting: Dict[str, Any]) -> None:
+        """Apply formatting to a paragraph"""
+        try:
+            # Apply alignment
+            if 'alignment' in formatting:
+                alignment_map = {
+                    'left': PP_ALIGN.LEFT,
+                    'center': PP_ALIGN.CENTER,
+                    'right': PP_ALIGN.RIGHT,
+                    'justify': PP_ALIGN.JUSTIFY
+                }
+                if formatting['alignment'] in alignment_map:
+                    paragraph.alignment = alignment_map[formatting['alignment']]
+            
+            # Apply spacing
+            if 'space_before' in formatting:
+                paragraph.space_before = Pt(formatting['space_before'])
+            if 'space_after' in formatting:
+                paragraph.space_after = Pt(formatting['space_after'])
+                
+        except Exception as e:
+            self.logger.debug(f"Error applying paragraph formatting: {e}")
     
     def apply_translations(self) -> None:
-        """Apply translated text back to the presentation"""
-        if not self.current_presentation:
-            raise ValueError("No presentation loaded")
-        
+        """Apply translated text to the presentation with preserved formatting"""
         if not self.text_elements:
-            raise ValueError("No text elements to apply")
+            raise ValidationError("No text elements to apply")
         
-        self.logger.info("Applying translations to presentation")
+        self.logger.info("Applying FIXED batch translations to presentation")
         
-        successful_applications = 0
-        failed_applications = 0
+        applied_count = 0
+        error_count = 0
         
         for element in self.text_elements:
             try:
-                translated_text = element.get('translated_text', element.get('original_text', ''))
-                if not translated_text:
+                if element['translated_text'] is None:
                     continue
                 
-                shape = element.get('shape_reference')
-                if not shape:
-                    failed_applications += 1
-                    continue
+                # Use the FIXED distribution method
+                self._distribute_translation_to_runs(element)
                 
-                # Apply the translation using simple method
-                if self._apply_text_simple(shape, translated_text):
-                    successful_applications += 1
-                else:
-                    failed_applications += 1
+                # Apply translated text to each run
+                for run_data in element['runs']:
+                    run = run_data['run_ref']
+                    translated_text = run_data.get('translated_text', run_data['text'])
+                    
+                    # Apply the translated text
+                    run.text = translated_text
+                    
+                    # Reapply formatting
+                    self._apply_run_formatting(run, run_data['formatting'])
+                
+                # Apply paragraph formatting
+                self._apply_paragraph_formatting(element['paragraph_ref'], element['paragraph_formatting'])
+                
+                applied_count += 1
+                self.logger.debug(f"Applied CLEAN translation to paragraph {element['id']}")
                 
             except Exception as e:
-                self.logger.error(f"Failed to apply translation: {e}")
-                failed_applications += 1
+                self.logger.error(f"Error applying translation to element {element.get('id', 'unknown')}: {e}")
+                error_count += 1
         
-        self.logger.info(f"Applied {successful_applications} translations successfully, {failed_applications} failed")
+        self.logger.info(f"Applied {applied_count} CLEAN translations, {error_count} errors")
+        self.processing_stats['error_count'] += error_count
     
-    def _apply_text_simple(self, shape, text: str) -> bool:
-        """
-        Simple text application that works reliably
-        
-        Args:
-            shape: PowerPoint shape object
-            text: Text to apply
+    def save_presentation(self) -> str:
+        """Save the modified presentation"""
+        if not self.presentation or not self.current_file:
+            raise PPTXProcessingError("No presentation loaded to save")
             
-        Returns:
-            True if successful, False otherwise
-        """
         try:
-            # Method 1: Direct text assignment
-            if hasattr(shape, 'text'):
-                shape.text = text
-                return True
+            # Create output filename
+            input_path = Path(self.current_file)
+            output_path = input_path.parent / f"{input_path.stem}_translated{input_path.suffix}"
             
-            # Method 2: Text frame assignment
-            if hasattr(shape, 'text_frame') and shape.text_frame:
-                shape.text_frame.text = text
-                return True
-            
-            # Method 3: Paragraph and run approach
-            if (hasattr(shape, 'text_frame') and 
-                shape.text_frame and 
-                hasattr(shape.text_frame, 'paragraphs') and
-                shape.text_frame.paragraphs):
-                
-                # Clear all paragraphs except the first
-                while len(shape.text_frame.paragraphs) > 1:
-                    p = shape.text_frame.paragraphs[-1]
-                    if hasattr(p, 'clear'):
-                        p.clear()
-                
-                # Set text in first paragraph
-                first_paragraph = shape.text_frame.paragraphs[0]
-                if hasattr(first_paragraph, 'clear'):
-                    first_paragraph.clear()
-                
-                if hasattr(first_paragraph, 'add_run'):
-                    run = first_paragraph.add_run()
-                    run.text = text
-                    return True
-            
-            return False
-            
+            self.presentation.save(str(output_path))
+            self.logger.info(f"Presentation saved to: {output_path}")
+            return str(output_path)
         except Exception as e:
-            self.logger.debug(f"Error in _apply_text_simple: {e}")
-            return False
-    
-    def save_presentation(self, output_path: Optional[Union[str, Path]] = None) -> Path:
-        """
-        Save the current presentation
-        
-        Args:
-            output_path: Optional output path. If None, adds '_translated' to original filename
-            
-        Returns:
-            Path to the saved file
-            
-        Raises:
-            ValueError: If no presentation is loaded
-            RuntimeError: If saving fails
-        """
-        if not self.current_presentation:
-            raise ValueError("No presentation loaded")
-        
-        if output_path is None:
-            # Generate output filename
-            original_path = Path(self.current_file_path)
-            output_path = original_path.parent / f"{original_path.stem}_translated{original_path.suffix}"
-        else:
-            output_path = Path(output_path)
-        
-        try:
-            self.logger.info(f"Saving presentation to: {output_path}")
-            
-            # Ensure output directory exists
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Save the presentation
-            self.current_presentation.save(str(output_path))
-            
-            self.logger.info(f"Presentation saved successfully: {output_path}")
-            return output_path
-            
-        except Exception as e:
-            raise RuntimeError(f"Failed to save presentation: {str(e)}")
+            self.logger.error(f"Failed to save presentation: {e}")
+            raise PPTXProcessingError(f"Cannot save presentation: {e}", file_path=str(output_path))
     
     def get_processing_stats(self) -> Dict[str, Any]:
-        """
-        Get processing statistics
-        
-        Returns:
-            Dictionary containing processing statistics
-        """
-        return {
-            'slides_processed': self.stats.slides_processed,
-            'text_elements_found': len(self.text_elements),
-            'text_elements_translated': self.stats.text_elements_translated,
-            'text_elements_skipped': self.stats.text_elements_skipped,
-            'errors_encountered': self.stats.errors_encountered,
-            'processing_time': self.stats.processing_time
-        }
-    
-    def close(self) -> None:
-        """Clean up resources"""
-        self.current_presentation = None
-        self.current_file_path = None
-        self.text_elements = []
-        self.stats = ProcessingStats()
-        self.logger.info("PPTX Processor closed")
+        """Get processing statistics"""
+        return self.processing_stats.copy()

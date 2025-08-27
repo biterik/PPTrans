@@ -1,12 +1,10 @@
-# Byte-compiled / optimized / DLL files
+# PPTrans .gitignore
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
-
-# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -20,66 +18,30 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+*.spec.backup
 
 # Unit test / coverage reports
 htmlcov/
 .tox/
+.nox/
 .coverage
 .coverage.*
 .cache
 nosetests.xml
 coverage.xml
 *.cover
+*.py,cover
 .hypothesis/
 .pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# celery beat schedule file
-celerybeat-schedule
-
-# SageMath parsed files
-*.sage.py
+cover/
 
 # Environments
 .env
@@ -90,51 +52,53 @@ ENV/
 env.bak/
 venv.bak/
 
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# PPTrans specific
-logs/
-config/
-*.backup
-*_translated.pptx
-temp_*
-
-# IDE files
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# macOS
+# OS
 .DS_Store
-.AppleDouble
-.LSOverride
-
-# Windows
-Thumbs.db
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 ehthumbs.db
-Desktop.ini
+Thumbs.db
 
-# Linux
-*~
+# PPTrans specific
+logs/*.log
+config
+*.backup*
+*_backup*
+*_translated.pptx
+*_translated.ppt
 
-# Temporary files
-*.tmp
-*.temp
+# Temporary development files
+*_fix.py
+*_test.py
+*_script.py
+debug_*.py
+test_*.py
+temp_*.py
+quick_*.py
+manual_*.py
+alternative_*.py
+*_context.txt
+*_context_*.txt
+
+# Build artifacts
+build_*.txt
+build_*.sh
+ssl_fix_*.sh
+
+# User data
+user_data/
+translations/
+temp/
+credentials/
+.env
+config.local.*
+*.json

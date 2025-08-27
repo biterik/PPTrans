@@ -1,448 +1,465 @@
 """
-Ultra-robust translation engine for PPTrans using Google Translate
-Handles all possible API response formats including the 'int' object error
+Enhanced Translation Engine using Google Cloud Translation API (Paid Tier)
+Preserves all existing content filtering, academic context, and post-processing
 """
-
+import os
 import time
 import re
-import json
-from typing import List, Dict, Optional, Tuple, Union, Any
-from googletrans import Translator, LANGUAGES
-import requests.exceptions
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, List, Tuple, Set
+from pathlib import Path
+from google.cloud import translate_v2 as translate
+from google.oauth2 import service_account
 
-from utils.logger import LoggerMixin, log_performance
-from utils.exceptions import (
-    TranslationError, NetworkError, RateLimitError, 
-    AuthenticationError, ValidationError
-)
-from .language_manager import LanguageManager
+# Handle imports for both test context (from project root) and app context (from src/)
+try:
+    from src.utils.logger import LoggerMixin
+    from src.utils.exceptions import TranslationError, NetworkError, RateLimitError
+except ImportError:
+    from utils.logger import LoggerMixin
+    from utils.exceptions import TranslationError, NetworkError, RateLimitError
+
 
 class PPTransTranslator(LoggerMixin):
-    """Ultra-robust translation engine with comprehensive error handling"""
+    """Enhanced translation service using Google Cloud API with reliable batch processing"""
     
-    def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize translator with configuration
+    def __init__(self, translation_settings: dict):
+        """Initialize with translation settings from config"""
+        self.settings = translation_settings
         
-        Args:
-            config: Configuration dictionary for translator settings
-        """
-        self.config = config or {}
-        self.chunk_size = self.config.get('chunk_size', 5000)
-        self.max_retries = self.config.get('max_retries', 3)
-        self.retry_delay = self.config.get('retry_delay', 1.0)
-        self.timeout = self.config.get('timeout', 30)
-        self.parallel_processing = self.config.get('parallel_processing', False)
-        self.max_workers = self.config.get('max_workers', 4)
+        # Initialize Google Cloud Translation client
+        self.client = self._initialize_google_client()
         
-        # Initialize Google Translator
-        self.translator = Translator(timeout=self.timeout)
-        self.language_manager = LanguageManager()
+        # Content filtering (preserved from your original)
+        self.skip_patterns = self._compile_skip_patterns()
+        self.context_terms = self._load_enhanced_context_terms()
         
-        # Statistics tracking
-        self.stats = {
-            'translations_performed': 0,
-            'characters_translated': 0,
-            'errors_encountered': 0,
-            'retries_performed': 0,
-            'total_time': 0.0
-        }
+        # Load external glossary for academic terms
+        self.glossary_terms = self._load_glossary_from_file()
         
-        self.logger.info(f"Translator initialized with config: {self.config}")
-    
-    def _is_translatable_text(self, text: str) -> bool:
-        """
-        Check if text contains translatable content
+        # With paid API, we can safely enable batch processing again!
+        self.use_batching = translation_settings.get('use_batching', True)
+        self.batch_size = translation_settings.get('batch_size', 50)  # Can handle larger batches now
         
-        Args:
-            text: Text to check
+        # Rate limiting (much more generous with paid API)
+        self.request_count = 0
+        self.hour_start_time = time.time()
         
-        Returns:
-            True if text should be translated
-        """
-        if not text or not text.strip():
-            return False
+        self.logger.info("PPTransTranslator initialized with Google Cloud API (paid tier)")
         
-        # Skip if text is only numbers, punctuation, or whitespace
-        if re.match(r'^[0-9\s\-.,;:!?()\[\]{}"\'\'/\\]*$', text.strip()):
-            return False
-        
-        # Skip very short text (likely not meaningful)
-        if len(text.strip()) < 2:
-            return False
-        
-        # Skip URLs
-        if re.match(r'^https?://', text.strip().lower()):
-            return False
-        
-        # Skip email addresses
-        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text.strip()):
-            return False
-        
-        return True
-    
-    def _safe_extract_translation(self, result: Any, original_text: str) -> str:
-        """
-        Ultra-robust extraction of translation text from any possible API response
-        
-        Args:
-            result: Translation result from googletrans (any type)
-            original_text: Original text that was being translated
-            
-        Returns:
-            Translated text string
-        """
+    def _initialize_google_client(self):
+        """Initialize Google Translate client with credentials from local directory."""
         try:
-            self.logger.debug(f"API result type: {type(result)}, value: {str(result)[:100]}...")
+            credentials_path = None
             
-            # Handle None result
-            if result is None:
-                self.logger.warning("API returned None result")
-                return original_text
+            # Method 1: Try local credentials directory FIRST (for PPTrans project)
+            project_root = Path(__file__).parent.parent.parent
+            potential_paths = [
+                project_root / "credentials" / "google-translate-key.json",
+                project_root / "credentials" / "service-account-key.json", 
+                project_root / "credentials" / "google-cloud-key.json",
+            ]
             
-            # Handle string result (direct translation)
-            if isinstance(result, str):
-                self.logger.debug("API returned direct string")
-                return result if result.strip() else original_text
-            
-            # Handle integer result (the problematic case)
-            if isinstance(result, int):
-                self.logger.warning(f"API returned integer result: {result}")
-                return original_text  # Return original text when API returns int
-            
-            # Handle float result
-            if isinstance(result, float):
-                self.logger.warning(f"API returned float result: {result}")
-                return original_text
-            
-            # Handle standard translation object with .text attribute
-            if hasattr(result, 'text'):
-                translated = result.text
-                self.logger.debug(f"Extracted via .text: {translated[:50]}...")
-                return translated if translated and translated.strip() else original_text
-            
-            # Handle object with .as_dict() method
-            if hasattr(result, 'as_dict'):
-                try:
-                    result_dict = result.as_dict()
-                    if isinstance(result_dict, dict):
-                        # Try different possible keys
-                        for key in ['translatedText', 'text', 'translation']:
-                            if key in result_dict:
-                                translated = result_dict[key]
-                                self.logger.debug(f"Extracted via as_dict()['{key}']: {translated[:50]}...")
-                                return translated if translated and translated.strip() else original_text
-                    self.logger.warning(f"as_dict() returned non-dict: {type(result_dict)}")
-                except Exception as e:
-                    self.logger.warning(f"Error calling as_dict(): {e}")
-            
-            # Handle dictionary result
-            if isinstance(result, dict):
-                self.logger.debug("API returned dictionary")
-                for key in ['translatedText', 'text', 'translation', 'result']:
-                    if key in result:
-                        translated = result[key]
-                        self.logger.debug(f"Extracted from dict['{key}']: {translated[:50]}...")
-                        return translated if translated and translated.strip() else original_text
-            
-            # Handle list result (sometimes API returns a list)
-            if isinstance(result, list):
-                self.logger.debug(f"API returned list with {len(result)} items")
-                if result:
-                    # Try to extract from first item
-                    first_item = result[0]
-                    return self._safe_extract_translation(first_item, original_text)
-            
-            # Handle tuple result
-            if isinstance(result, tuple):
-                self.logger.debug(f"API returned tuple with {len(result)} items")
-                if result:
-                    # Try to extract from first item
-                    first_item = result[0]
-                    return self._safe_extract_translation(first_item, original_text)
-            
-            # Last resort: try to convert to string
-            result_str = str(result).strip()
-            if result_str and result_str != str(type(result)):
-                self.logger.debug(f"Using string conversion: {result_str[:50]}...")
-                return result_str
-            
-            # Ultimate fallback: return original text
-            self.logger.warning(f"Could not extract translation from {type(result)}, returning original")
-            return original_text
-            
-        except Exception as e:
-            self.logger.error(f"Error in _safe_extract_translation: {e}")
-            return original_text
-    
-    def _create_fallback_translator(self):
-        """Create a new translator instance as fallback"""
-        try:
-            return Translator(timeout=self.timeout)
-        except Exception as e:
-            self.logger.warning(f"Could not create fallback translator: {e}")
-            return None
-    
-    @log_performance
-    def translate_text(
-        self, 
-        text: str, 
-        source_lang: str = 'auto', 
-        target_lang: str = 'en'
-    ) -> str:
-        """
-        Ultra-robust text translation with comprehensive error handling
-        
-        Args:
-            text: Text to translate
-            source_lang: Source language code (default: 'auto')
-            target_lang: Target language code (default: 'en')
-        
-        Returns:
-            Translated text
-        """
-        if not text or not text.strip():
-            return text
-        
-        # Check if text needs translation
-        if not self._is_translatable_text(text):
-            self.logger.debug(f"Skipping non-translatable text: {text[:50]}...")
-            return text
-        
-        # Validate languages
-        if not self.language_manager.is_valid_language_code(source_lang) and source_lang != 'auto':
-            self.logger.warning(f"Invalid source language code: {source_lang}, using 'auto'")
-            source_lang = 'auto'
-        
-        if not self.language_manager.is_valid_language_code(target_lang):
-            self.logger.warning(f"Invalid target language code: {target_lang}, using 'en'")
-            target_lang = 'en'
-        
-        # Skip if source and target are the same (and not auto-detect)
-        if source_lang == target_lang and source_lang != 'auto':
-            return text
-        
-        last_exception = None
-        current_translator = self.translator
-        
-        # Try with main translator first, then fallback translator
-        for translator_attempt in range(2):
-            if translator_attempt == 1:
-                self.logger.info("Trying fallback translator...")
-                fallback_translator = self._create_fallback_translator()
-                if fallback_translator:
-                    current_translator = fallback_translator
-                else:
+            for path in potential_paths:
+                if path.exists():
+                    credentials_path = str(path.absolute())
+                    self.logger.info(f"Using local credentials: {credentials_path}")
                     break
             
-            for attempt in range(self.max_retries + 1):
-                try:
-                    # Add delay between retries (but not on first attempt)
-                    if attempt > 0:
-                        delay = self.retry_delay * (attempt ** 2)  # Exponential backoff
-                        self.logger.debug(f"Waiting {delay:.1f}s before retry {attempt}")
-                        time.sleep(delay)
-                        self.stats['retries_performed'] += 1
-                    
-                    self.logger.debug(f"Translation attempt {attempt + 1}/{self.max_retries + 1} "
-                                    f"(translator {translator_attempt + 1}/2): '{text[:50]}...'")
-                    
-                    # Perform translation
-                    result = current_translator.translate(
-                        text, 
-                        src=source_lang, 
-                        dest=target_lang
-                    )
-                    
-                    # Extract translated text using ultra-robust method
-                    translated_text = self._safe_extract_translation(result, text)
-                    
-                    # Update statistics
-                    self.stats['translations_performed'] += 1
-                    self.stats['characters_translated'] += len(text)
-                    
-                    # Log success
-                    if source_lang == 'auto':
-                        detected_lang = getattr(result, 'src', 'unknown') if hasattr(result, 'src') else 'unknown'
-                        self.logger.debug(f"✅ Translated ({detected_lang}→{target_lang}): '{text[:30]}...' → '{translated_text[:30]}...'")
-                    else:
-                        self.logger.debug(f"✅ Translated ({source_lang}→{target_lang}): '{text[:30]}...' → '{translated_text[:30]}...'")
-                    
-                    return translated_text
-                    
-                except requests.exceptions.ConnectionError as e:
-                    last_exception = f"Network connection failed: {str(e)}"
-                    self.logger.warning(f"Network error on attempt {attempt + 1}: {e}")
-                    
-                except requests.exceptions.Timeout as e:
-                    last_exception = f"Translation request timed out: {str(e)}"
-                    self.logger.warning(f"Timeout error on attempt {attempt + 1}: {e}")
-                    
-                except requests.exceptions.HTTPError as e:
-                    if hasattr(e, 'response') and e.response is not None:
-                        if e.response.status_code == 429:
-                            last_exception = f"Rate limit exceeded: {str(e)}"
-                            self.logger.warning(f"Rate limit error on attempt {attempt + 1}: {e}")
-                            time.sleep(self.retry_delay * 3)  # Longer delay for rate limits
-                        elif e.response.status_code in [401, 403]:
-                            last_exception = f"Authentication failed: {str(e)}"
-                            self.logger.error(f"Auth error on attempt {attempt + 1}: {e}")
-                            break  # Don't retry auth errors
-                        else:
-                            last_exception = f"HTTP error {e.response.status_code}: {str(e)}"
-                            self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
-                    else:
-                        last_exception = f"HTTP error: {str(e)}"
-                        self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
-                        
-                except Exception as e:
-                    # Handle any other exception
-                    error_msg = str(e)
-                    last_exception = f"Translation error: {error_msg}"
-                    self.logger.warning(f"Translation error on attempt {attempt + 1} "
-                                      f"(translator {translator_attempt + 1}): {last_exception}")
-                    
-                    # If this is an API format error, no point in retrying with same translator
-                    if "'int' object has no attribute" in error_msg or "has no attribute 'as_dict'" in error_msg:
-                        break  # Try fallback translator instead
-        
-        # All attempts and fallbacks failed - return original text (graceful degradation)
-        self.stats['errors_encountered'] += 1
-        self.logger.warning(f"Translation completely failed, returning original text: '{text[:50]}...'")
-        return text
-    
-    def translate_batch(
-        self, 
-        texts: List[str], 
-        source_lang: str = 'auto', 
-        target_lang: str = 'en',
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """
-        Translate multiple texts with optional parallel processing
-        
-        Args:
-            texts: List of texts to translate
-            source_lang: Source language code
-            target_lang: Target language code
-            progress_callback: Optional callback function for progress updates
-        
-        Returns:
-            List of translated texts
-        """
-        if not texts:
-            return []
-        
-        self.logger.info(f"Starting batch translation of {len(texts)} items ({source_lang}→{target_lang})")
-        
-        if self.parallel_processing and len(texts) > 1:
-            return self._translate_parallel(texts, source_lang, target_lang, progress_callback)
-        else:
-            return self._translate_sequential(texts, source_lang, target_lang, progress_callback)
-    
-    def _translate_sequential(
-        self, 
-        texts: List[str], 
-        source_lang: str, 
-        target_lang: str,
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """Translate texts sequentially"""
-        translated = []
-        total = len(texts)
-        
-        for i, text in enumerate(texts):
-            try:
-                result = self.translate_text(text, source_lang, target_lang)
-                translated.append(result)
-                
-                if progress_callback:
-                    progress_callback(i + 1, total, f"Translated item {i + 1}/{total}")
-                    
-            except Exception as e:
-                self.logger.warning(f"Failed to translate item {i}: {e}")
-                translated.append(text)  # Keep original text on failure
-        
-        return translated
-    
-    def _translate_parallel(
-        self, 
-        texts: List[str], 
-        source_lang: str, 
-        target_lang: str,
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """Translate texts in parallel using ThreadPoolExecutor"""
-        translated = [''] * len(texts)  # Pre-allocate list to maintain order
-        completed = 0
-        total = len(texts)
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all translation tasks
-            future_to_index = {
-                executor.submit(self.translate_text, text, source_lang, target_lang): i
-                for i, text in enumerate(texts)
-            }
+            if credentials_path:
+                # Load credentials explicitly from local file
+                credentials = service_account.Credentials.from_service_account_file(credentials_path)
+                client = translate.Client(credentials=credentials)
+            else:
+                # Fallback: try environment variable (but warn about it)
+                env_var = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+                if env_var:
+                    self.logger.warning(f"No local credentials found, falling back to environment variable: {env_var}")
+                    client = translate.Client()
+                else:
+                    raise FileNotFoundError("No credentials found")
             
-            # Process completed translations
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    result = future.result()
-                    translated[index] = result
-                except Exception as e:
-                    self.logger.warning(f"Failed to translate item {index}: {e}")
-                    translated[index] = texts[index]  # Keep original on failure
+            # Test the connection
+            self._test_api_connection(client)
+            
+            self.logger.info("Google Cloud Translation API initialized successfully")
+            return client
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Google Cloud Translation API: {e}")
+            
+            error_msg = (f"API initialization failed: {e}\n"
+                       "Please ensure:\n"
+                       "1. Place your PPTrans JSON key in credentials/google-translate-key.json\n"
+                       "2. The service account has 'Cloud Translation API User' role\n"
+                       "3. The Cloud Translation API is enabled in your Google Cloud project")
+            
+            raise TranslationError(error_msg)
+    
+    def _test_api_connection(self, client):
+        """Test API connection with a simple translation."""
+        try:
+            result = client.translate("test", target_language="de")
+            translated_text = result.get('translatedText', '').lower()
+            
+            # Check if we got a valid translation (should be "Test" or "testen" in German)
+            if translated_text and translated_text != "test":
+                self.logger.debug(f"API connection test successful: 'test' -> '{translated_text}'")
+                return True
+            else:
+                raise ConnectionError("API test returned empty or unchanged result")
                 
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, total, f"Translated item {completed}/{total}")
+        except Exception as e:
+            raise ConnectionError(f"Google Cloud Translation API connection failed: {e}")
         
-        return translated
+    def _compile_skip_patterns(self) -> List[re.Pattern]:
+        """Patterns for content that shouldn't be translated (preserved from original)"""
+        patterns = [
+            re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),  # Email
+            re.compile(r'^[\+\d\s\-\(\)☎📧]{6,}$'),  # Phone numbers and symbols
+            re.compile(r'^https?://'),  # URLs
+            re.compile(r'^[^\w\s]{1,3}$'),  # Single symbols/punctuation
+            re.compile(r'^\d+$'),  # Numbers only
+            re.compile(r'^[A-Z][a-z]+ [A-Z][a-z]+$'),  # Names (First Last)
+            re.compile(r'^\s*[\.,;:!\?|►▪•♦<>]+\s*$'),  # Punctuation/symbols
+            re.compile(r'^.{1,2}$'),  # Very short content
+        ]
+        return patterns
     
-    def get_supported_languages(self) -> Dict[str, str]:
-        """
-        Get dictionary of supported language codes and names
-        
-        Returns:
-            Dictionary mapping language codes to language names
-        """
-        return self.language_manager.get_all_languages()
+    def _load_enhanced_context_terms(self) -> Dict[str, str]:
+        """Enhanced context-specific terms with better German academic vocabulary (preserved from original)"""
+        return {
+            # University/Academic terms
+            'Erstsemestertag': 'First Semester Orientation Day',
+            'Studierende': 'students',
+            'Studierenden': 'students',  # Different case
+            'Studiengang': 'degree program',
+            'Hochschule Heilbronn': 'Heilbronn University of Applied Sciences',
+            'Heilbronn': 'Heilbronn',
+            'Standort': 'location',  # This was causing the repetition
+            'Standortes': 'location',
+            'des Standortes': 'of the campus',  # Better contextual translation
+            'am Standort': 'at the campus',
+            'für den Standort': 'for the campus',
+            
+            # Student organization terms
+            'Vertritt die Interessen': 'Represents the interests',
+            'Plant Veranstaltungen': 'Plans events',
+            'Seien Sie aktiv': 'Be active',
+            'engagieren Sie sich': 'get involved',
+            
+            # Academic activities
+            'Veranstaltungen': 'events',
+            'Vorlesung': 'lecture',
+            'Seminar': 'seminar',
+            'Übung': 'tutorial',
+            'Prüfung': 'exam',
+            'Semester': 'semester',
+            'Campus': 'campus',
+            
+            # General German terms that are often mistranslated
+            'aller Art': 'of all kinds',
+            'sich engagieren': 'get involved',
+            'aktiv sein': 'be active',
+            
+            # Keep German place names
+            'Deutschland': 'Germany',
+            'Baden-Württemberg': 'Baden-Württemberg',
+            
+            # Names and titles that shouldn't be translated
+            'GDM': 'GDM',
+            'Ani Antonyan': 'Ani Antonyan',
+            'mv-international': 'mv-international',
+            'hs-heilbronn.de': 'hs-heilbronn.de',
+        }
     
-    def detect_language(self, text: str) -> Optional[str]:
-        """
-        Detect the language of given text
-        
-        Args:
-            text: Text to analyze
-        
-        Returns:
-            Detected language code or None if detection fails
-        """
+    def _should_skip_translation(self, text: str) -> bool:
+        """Check if text should be skipped entirely (preserved from original)"""
         if not text or not text.strip():
-            return None
+            return True
+            
+        text_clean = text.strip()
+        
+        # Check skip patterns
+        for pattern in self.skip_patterns:
+            if pattern.match(text_clean):
+                self.logger.debug(f"Skipping translation (pattern match): '{text_clean}'")
+                return True
+        
+        # Skip if only whitespace or punctuation
+        if not re.search(r'\w', text_clean):
+            self.logger.debug(f"Skipping translation (no words): '{text_clean}'")
+            return True
+            
+        return False
+    
+    def _load_glossary_from_file(self) -> Dict[str, str]:
+        """Load academic glossary from external file"""
+        glossary = {}
+        
+        # Try to find glossary file
+        project_root = Path(__file__).parent.parent.parent
+        glossary_paths = [
+            project_root / "academic_glossary.txt",
+            project_root / "config" / "academic_glossary.txt",
+            project_root / "resources" / "academic_glossary.txt",
+        ]
+        
+        glossary_file = None
+        for path in glossary_paths:
+            if path.exists():
+                glossary_file = path
+                break
+        
+        if not glossary_file:
+            self.logger.warning("No external glossary file found, using built-in terms")
+            return self._get_fallback_glossary()
         
         try:
-            result = self.translator.detect(text)
-            detected_lang = result.lang if hasattr(result, 'lang') else str(result)
-            self.logger.debug(f"Detected language: {detected_lang} for text: '{text[:50]}...'")
-            return detected_lang
+            with open(glossary_file, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    # Parse format: source_term = target_translation
+                    if '=' in line:
+                        source, target = line.split('=', 1)
+                        source = source.strip().lower()  # Case-insensitive matching
+                        target = target.strip()
+                        
+                        if source and target:
+                            glossary[source] = target
+                            
+            self.logger.info(f"Loaded {len(glossary)} terms from glossary file: {glossary_file}")
+            return glossary
+            
         except Exception as e:
-            self.logger.warning(f"Language detection failed: {e}")
-            return None
+            self.logger.error(f"Error loading glossary file {glossary_file}: {e}")
+            return self._get_fallback_glossary()
     
-    def get_statistics(self) -> Dict:
-        """Get translation statistics"""
-        return self.stats.copy()
-    
-    def reset_statistics(self) -> None:
-        """Reset translation statistics"""
-        self.stats = {
-            'translations_performed': 0,
-            'characters_translated': 0,
-            'errors_encountered': 0,
-            'retries_performed': 0,
-            'total_time': 0.0
+    def _get_fallback_glossary(self) -> Dict[str, str]:
+        """Fallback glossary if external file not available"""
+        return {
+            'students': 'students',
+            'student': 'student',
+            'location': 'campus',
+            'site': 'campus',
+            'first semester day': 'First Semester Orientation Day',
+            'university of applied sciences': 'University of Applied Sciences',
+            'college': 'University of Applied Sciences',
         }
-        self.logger.info("Translation statistics reset")
+    
+    def _apply_glossary_fixes(self, translated_text: str) -> str:
+        """Apply academic term glossary fixes after Google translation"""
+        if not translated_text:
+            return translated_text
+            
+        fixed = translated_text
+        
+        # Apply glossary fixes loaded from external file
+        for source_term, target_term in self.glossary_terms.items():
+            if source_term in fixed.lower():
+                # Use regex for case-insensitive replacement while preserving case context
+                pattern = re.compile(re.escape(source_term), re.IGNORECASE)
+                fixed = pattern.sub(target_term, fixed)
+                self.logger.debug(f"Glossary fix: {source_term} -> {target_term}")
+        
+        return fixed
+    
+    def _postprocess_translation(self, original: str, translated: str) -> str:
+        """Post-process translation to fix common issues (preserved from original)"""
+        if not translated or translated == original:
+            return translated
+        
+        fixed = translated
+        
+        # Fix common repetition patterns
+        repetition_fixes = {
+            'of the location of the location': 'of the campus',
+            'the location of the location': 'the campus',
+            'for the location': 'for the campus',
+            'at the location': 'at the campus',
+            'students of the location': 'students at the campus',
+        }
+        
+        for bad_phrase, good_phrase in repetition_fixes.items():
+            if bad_phrase in fixed.lower():
+                fixed = re.sub(re.escape(bad_phrase), good_phrase, fixed, flags=re.IGNORECASE)
+                self.logger.debug(f"Post-processing fix: {bad_phrase} -> {good_phrase}")
+        
+        return fixed
+    
+    def _track_api_usage(self):
+        """Track API usage (much more generous limits with paid API)"""
+        current_time = time.time()
+        
+        # Reset hourly counter
+        if current_time - self.hour_start_time > 3600:
+            self.request_count = 0
+            self.hour_start_time = current_time
+        
+        self.request_count += 1
+        
+        # Log usage but don't enforce strict limits (paid API is very generous)
+        if self.request_count % 100 == 0:
+            self.logger.info(f"API usage: {self.request_count} requests in current hour")
+    
+    def translate_text(self, text: str, source_lang: str = 'de', target_lang: str = 'en') -> str:
+        """
+        Single text translation - simplified for German->English PowerPoint slides
+        """
+        if not text or not text.strip():
+            return text
+        
+        if self._should_skip_translation(text):
+            return text
+        
+        try:
+            self._track_api_usage()
+            
+            # Send directly to Google Translate with explicit German source
+            result = self.client.translate(
+                text,
+                source_language=source_lang,
+                target_language=target_lang
+            )
+            
+            translated = result['translatedText']
+            
+            # Apply your post-processing fixes
+            final_translation = self._postprocess_translation(text, translated)
+            
+            # Apply glossary substitutions after Google translation
+            final_translation = self._apply_glossary_fixes(final_translation)
+            
+            if final_translation != text:
+                self.logger.debug(f"Translated: '{text}' -> '{final_translation}'")
+            
+            return final_translation
+            
+        except Exception as e:
+            self.logger.error(f"Translation failed for '{text[:30]}...': {e}")
+            return text  # Return original on error
+    
+    def translate_text_batch(self, text_items: List[str], source_lang: str = 'de', target_lang: str = 'en') -> List[str]:
+        """
+        Translate multiple text items using reliable batch processing
+        Now enabled again with paid Google Cloud API!
+        """
+        if not text_items:
+            return []
+        
+        if not self.use_batching:
+            # Fall back to individual translation if batching disabled
+            self.logger.info("Batch processing disabled, using individual translation")
+            return [self.translate_text(text, source_lang, target_lang) for text in text_items]
+        
+        self.logger.info(f"Batch translating {len(text_items)} items with Google Cloud API")
+        
+        # Separate items that need translation from those that should be skipped
+        translatable_items = []
+        skipped_indices = set()
+        translated_items = [''] * len(text_items)
+        
+        for i, text in enumerate(text_items):
+            if self._should_skip_translation(text):
+                skipped_indices.add(i)
+                translated_items[i] = text  # Keep original
+                self.logger.debug(f"Skipped item {i+1}: '{text[:30]}...'")
+            else:
+                translatable_items.append((i, text))
+        
+        if not translatable_items:
+            self.logger.info("No items to translate (all skipped)")
+            return translated_items
+        
+        # Process in batches
+        for batch_start in range(0, len(translatable_items), self.batch_size):
+            batch_end = min(batch_start + self.batch_size, len(translatable_items))
+            batch = translatable_items[batch_start:batch_end]
+            
+            try:
+                self._track_api_usage()
+                
+                # Extract texts for batch translation
+                batch_texts = [item[1] for item in batch]  # original text
+                
+                # Batch translate using Google Cloud API
+                results = self.client.translate(
+                    batch_texts,
+                    source_language=source_lang,
+                    target_language=target_lang
+                )
+                
+                # Apply translations back to original positions
+                for (original_index, original_text), result in zip(batch, results):
+                    translated = result['translatedText']
+                    
+                    # Post-process and apply glossary fixes
+                    final_translation = self._postprocess_translation(original_text, translated)
+                    final_translation = self._apply_glossary_fixes(final_translation)
+                    translated_items[original_index] = final_translation
+                    
+                    if final_translation != original_text:
+                        self.logger.debug(f"Batch translated item {original_index+1}: '{original_text[:30]}...' -> '{final_translation[:30]}...'")
+                
+                self.logger.info(f"Batch {batch_start//self.batch_size + 1}: Processed {len(batch)} items")
+                
+            except Exception as e:
+                self.logger.error(f"Batch translation failed for batch {batch_start//self.batch_size + 1}: {e}")
+                # Fallback to individual translation for this batch
+                for original_index, original_text in batch:
+                    try:
+                        individual_result = self.translate_text(original_text, source_lang, target_lang)
+                        translated_items[original_index] = individual_result
+                    except Exception as individual_error:
+                        self.logger.error(f"Individual fallback failed for item {original_index+1}: {individual_error}")
+                        translated_items[original_index] = original_text  # Keep original
+        
+        # Calculate success statistics
+        successful_translations = sum(1 for i, item in enumerate(translated_items) 
+                                    if i not in skipped_indices and item != text_items[i])
+        
+        self.logger.info(f"Batch translation completed: {successful_translations}/{len(text_items) - len(skipped_indices)} items translated, {len(skipped_indices)} skipped")
+        
+        return translated_items
+    
+    def test_connection(self) -> bool:
+        """Test connection to Google Cloud Translation service"""
+        try:
+            test_result = self.translate_text("Studierende besuchen Vorlesungen", source_lang='de', target_lang='en')
+            success = test_result.lower() != "studierende besuchen vorlesungen" and test_result.strip() != ""
+            if success:
+                self.logger.info(f"Connection test successful: 'Studierende besuchen Vorlesungen' -> '{test_result}'")
+            else:
+                self.logger.error(f"Connection test failed - got: '{test_result}'")
+            return success
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
+    
+    def get_translation_stats(self) -> Dict[str, int]:
+        """Get translation statistics"""
+        current_time = time.time()
+        time_in_current_hour = current_time - self.hour_start_time
+        
+        return {
+            'requests_made': self.request_count,
+            'time_in_current_hour': int(time_in_current_hour),
+            'time_until_reset': max(0, int(3600 - time_in_current_hour)),
+            'api_type': 'Google Cloud Translation API (Paid)',
+            'batch_processing_enabled': self.use_batching,
+            'batch_size': self.batch_size
+        }
+    
+    def get_supported_languages(self) -> List[Dict[str, str]]:
+        """Get list of supported languages from Google Cloud API"""
+        try:
+            languages = self.client.get_languages()
+            return [{'code': lang['language'], 'name': lang.get('name', lang['language'])} 
+                   for lang in languages]
+        except Exception as e:
+            self.logger.error(f"Failed to get supported languages: {e}")
+            return []

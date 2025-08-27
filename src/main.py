@@ -9,6 +9,9 @@ import os
 import traceback
 from pathlib import Path
 
+import logging
+logging.getLogger().setLevel(logging.DEBUG)
+
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 

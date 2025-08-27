@@ -238,7 +238,7 @@ class PPTransMainWindow(LoggerMixin):
         self.target_lang_combo['values'] = target_names
         
         # Set default values
-        default_source = self.config.get("translation.default_source_language", "auto")
+        default_source = self.config.get("translation.default_source_language", "de")
         default_target = self.config.get("translation.default_target_language", "en")
         
         self._set_language_combo_value(self.source_lang_combo, self.source_lang_var, default_source)
@@ -309,14 +309,14 @@ class PPTransMainWindow(LoggerMixin):
             self.status_var.set("Select a PowerPoint file to begin")
     
     def _update_file_info(self):
-        """Update file information display"""
+        """Update file information display - FIXED: Added advanced_settings parameter"""
         if not self.current_file or not os.path.exists(self.current_file):
             self.file_info_var.set("")
             return
         
         try:
-            # Load presentation to get info
-            processor = PPTXProcessor()
+            # Load presentation to get info - FIX: Pass advanced_settings from config
+            processor = PPTXProcessor(self.config.get_section("advanced"))
             processor.load_presentation(self.current_file)
             info = processor.get_presentation_info()
             

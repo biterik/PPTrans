@@ -1,0 +1,86 @@
+# PPTrans Academic Glossary
+# Format: source_term = target_translation
+# Lines starting with # are comments
+# Case-insensitive matching
+
+# Basic academic terms
+students = students
+student = student
+location = campus
+site = campus
+standort = campus
+
+# German university terms
+erstsemestertag = First Semester Orientation Day
+studierende = students
+studierenden = students
+studiengang = degree program
+hochschule heilbronn = Heilbronn University of Applied Sciences
+heilbronn = Heilbronn
+des standortes = of the campus
+am standort = at the campus
+für den standort = for the campus
+
+# Student organization and activities
+vertritt die interessen = Represents the interests
+plant veranstaltungen = Plans events
+seien sie aktiv = Be active
+engagieren sie sich = get involved
+veranstaltungen = events
+vorlesung = lecture
+seminar = seminar
+übung = tutorial
+prüfung = exam
+semester = semester
+campus = campus
+
+# Academic processes
+first semester day = First Semester Orientation Day
+orientation day for first-year students = First Semester Orientation Day
+first semester orientation = First Semester Orientation Day
+university of applied sciences = University of Applied Sciences
+college = University of Applied Sciences
+hochschule für angewandte wissenschaften = University of Applied Sciences
+
+# Common phrases
+represents the interests = Represents the interests
+plans events = Plans events
+get involved = get involved
+be active = be active
+aller art = of all kinds
+sich engagieren = get involved
+aktiv sein = be active
+
+# Geographic terms
+deutschland = Germany
+baden-württemberg = Baden-Württemberg
+
+# Proper nouns that should remain unchanged
+gdm = GDM
+ani antonyan = Ani Antonyan
+mv-international = mv-international
+hs-heilbronn.de = hs-heilbronn.de
+
+# Additional academic terms
+fakultät = faculty
+fachbereich = department
+dozent = lecturer
+professor = professor
+bibliothek = library
+mensa = cafeteria
+studentenwohnheim = student dormitory
+immatrikulation = enrollment
+exmatrikulation = deregistration
+bachelorstudiengang = bachelor's program
+masterstudiengang = master's program
+diplomarbeit = thesis
+abschlussarbeit = final thesis
+klausur = exam
+hausarbeit = term paper
+praktikum = internship
+auslandssemester = semester abroad
+studiengebühren = tuition fees
+stipendium = scholarship
+vorlesungsverzeichnis = course catalog
+stundenplan = timetable
+sprechstunde = office hours
