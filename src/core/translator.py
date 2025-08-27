@@ -1,448 +1,205 @@
 """
-Ultra-robust translation engine for PPTrans using Google Translate
-Handles all possible API response formats including the 'int' object error
+Translation Engine - Fixed to match GUI expectations
 """
-
+import requests
+import json
 import time
 import re
-import json
-from typing import List, Dict, Optional, Tuple, Union, Any
-from googletrans import Translator, LANGUAGES
-import requests.exceptions
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+from urllib.parse import quote
+from utils.logger import LoggerMixin
+from utils.exceptions import TranslationError, NetworkError, RateLimitError
 
-from utils.logger import LoggerMixin, log_performance
-from utils.exceptions import (
-    TranslationError, NetworkError, RateLimitError, 
-    AuthenticationError, ValidationError
-)
-from .language_manager import LanguageManager
 
 class PPTransTranslator(LoggerMixin):
-    """Ultra-robust translation engine with comprehensive error handling"""
+    """Translation service that matches GUI expectations"""
     
-    def __init__(self, config: Optional[Dict] = None):
-        """
-        Initialize translator with configuration
+    def __init__(self, translation_settings: dict):
+        """Initialize with translation settings from config"""
+        self.settings = translation_settings
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        self.last_request_time = 0
+        self.min_request_interval = 0.5  # 500ms between requests
         
-        Args:
-            config: Configuration dictionary for translator settings
-        """
-        self.config = config or {}
-        self.chunk_size = self.config.get('chunk_size', 5000)
-        self.max_retries = self.config.get('max_retries', 3)
-        self.retry_delay = self.config.get('retry_delay', 1.0)
-        self.timeout = self.config.get('timeout', 30)
-        self.parallel_processing = self.config.get('parallel_processing', False)
-        self.max_workers = self.config.get('max_workers', 4)
+        self.logger.info("PPTransTranslator initialized")
         
-        # Initialize Google Translator
-        self.translator = Translator(timeout=self.timeout)
-        self.language_manager = LanguageManager()
-        
-        # Statistics tracking
-        self.stats = {
-            'translations_performed': 0,
-            'characters_translated': 0,
-            'errors_encountered': 0,
-            'retries_performed': 0,
-            'total_time': 0.0
-        }
-        
-        self.logger.info(f"Translator initialized with config: {self.config}")
+    def _wait_for_rate_limit(self):
+        """Implement rate limiting between requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.min_request_interval:
+            time.sleep(self.min_request_interval - time_since_last)
+        self.last_request_time = time.time()
     
-    def _is_translatable_text(self, text: str) -> bool:
-        """
-        Check if text contains translatable content
+    def _clean_text(self, text: str) -> str:
+        """Clean text before translation"""
+        if not text:
+            return ""
         
-        Args:
-            text: Text to check
-        
-        Returns:
-            True if text should be translated
-        """
-        if not text or not text.strip():
-            return False
-        
-        # Skip if text is only numbers, punctuation, or whitespace
-        if re.match(r'^[0-9\s\-.,;:!?()\[\]{}"\'\'/\\]*$', text.strip()):
-            return False
-        
-        # Skip very short text (likely not meaningful)
-        if len(text.strip()) < 2:
-            return False
-        
-        # Skip URLs
-        if re.match(r'^https?://', text.strip().lower()):
-            return False
-        
-        # Skip email addresses
-        if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', text.strip()):
-            return False
-        
-        return True
+        # Remove excessive whitespace but preserve single spaces
+        cleaned = re.sub(r'\s+', ' ', text.strip())
+        return cleaned
     
-    def _safe_extract_translation(self, result: Any, original_text: str) -> str:
-        """
-        Ultra-robust extraction of translation text from any possible API response
-        
-        Args:
-            result: Translation result from googletrans (any type)
-            original_text: Original text that was being translated
-            
-        Returns:
-            Translated text string
-        """
+    def _translate_via_google_http(self, text: str, source_lang: str = 'auto', target_lang: str = 'en') -> str:
+        """Direct HTTP translation using Google Translate"""
         try:
-            self.logger.debug(f"API result type: {type(result)}, value: {str(result)[:100]}...")
+            self._wait_for_rate_limit()
             
-            # Handle None result
-            if result is None:
-                self.logger.warning("API returned None result")
-                return original_text
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {
+                'client': 'gtx',
+                'sl': source_lang,
+                'tl': target_lang,
+                'dt': 't',
+                'q': text
+            }
             
-            # Handle string result (direct translation)
-            if isinstance(result, str):
-                self.logger.debug("API returned direct string")
-                return result if result.strip() else original_text
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
             
-            # Handle integer result (the problematic case)
-            if isinstance(result, int):
-                self.logger.warning(f"API returned integer result: {result}")
-                return original_text  # Return original text when API returns int
+            result = response.json()
             
-            # Handle float result
-            if isinstance(result, float):
-                self.logger.warning(f"API returned float result: {result}")
-                return original_text
+            # Extract translated text from response
+            if result and len(result) > 0 and result[0]:
+                translated_parts = []
+                for part in result[0]:
+                    if part and len(part) > 0:
+                        translated_parts.append(part[0])
+                
+                translated_text = ''.join(translated_parts)
+                if translated_text and translated_text.strip():
+                    self.logger.debug(f"HTTP translation successful: '{text[:50]}...' -> '{translated_text[:50]}...'")
+                    return translated_text.strip()
             
-            # Handle standard translation object with .text attribute
-            if hasattr(result, 'text'):
-                translated = result.text
-                self.logger.debug(f"Extracted via .text: {translated[:50]}...")
-                return translated if translated and translated.strip() else original_text
+            raise TranslationError("Invalid response format from Google Translate")
             
-            # Handle object with .as_dict() method
-            if hasattr(result, 'as_dict'):
-                try:
-                    result_dict = result.as_dict()
-                    if isinstance(result_dict, dict):
-                        # Try different possible keys
-                        for key in ['translatedText', 'text', 'translation']:
-                            if key in result_dict:
-                                translated = result_dict[key]
-                                self.logger.debug(f"Extracted via as_dict()['{key}']: {translated[:50]}...")
-                                return translated if translated and translated.strip() else original_text
-                    self.logger.warning(f"as_dict() returned non-dict: {type(result_dict)}")
-                except Exception as e:
-                    self.logger.warning(f"Error calling as_dict(): {e}")
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"HTTP translation failed: {e}")
+            raise NetworkError(f"Network error: {e}", url=url)
+        except Exception as e:
+            self.logger.error(f"HTTP translation error: {e}")
+            raise TranslationError(f"Translation failed: {e}")
+    
+    def _translate_via_mymemory(self, text: str, source_lang: str = 'auto', target_lang: str = 'en') -> str:
+        """Fallback translation using MyMemory API"""
+        try:
+            self._wait_for_rate_limit()
             
-            # Handle dictionary result
-            if isinstance(result, dict):
-                self.logger.debug("API returned dictionary")
-                for key in ['translatedText', 'text', 'translation', 'result']:
-                    if key in result:
-                        translated = result[key]
-                        self.logger.debug(f"Extracted from dict['{key}']: {translated[:50]}...")
-                        return translated if translated and translated.strip() else original_text
+            # Convert language codes if needed
+            lang_pair = f"{source_lang}|{target_lang}" if source_lang != 'auto' else f"de|{target_lang}"
             
-            # Handle list result (sometimes API returns a list)
-            if isinstance(result, list):
-                self.logger.debug(f"API returned list with {len(result)} items")
-                if result:
-                    # Try to extract from first item
-                    first_item = result[0]
-                    return self._safe_extract_translation(first_item, original_text)
+            url = "https://api.mymemory.translated.net/get"
+            params = {
+                'q': text,
+                'langpair': lang_pair
+            }
             
-            # Handle tuple result
-            if isinstance(result, tuple):
-                self.logger.debug(f"API returned tuple with {len(result)} items")
-                if result:
-                    # Try to extract from first item
-                    first_item = result[0]
-                    return self._safe_extract_translation(first_item, original_text)
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
             
-            # Last resort: try to convert to string
-            result_str = str(result).strip()
-            if result_str and result_str != str(type(result)):
-                self.logger.debug(f"Using string conversion: {result_str[:50]}...")
-                return result_str
+            result = response.json()
             
-            # Ultimate fallback: return original text
-            self.logger.warning(f"Could not extract translation from {type(result)}, returning original")
-            return original_text
+            if result.get('responseStatus') == 200:
+                translated_text = result.get('responseData', {}).get('translatedText', '')
+                if translated_text and translated_text != text:
+                    self.logger.debug(f"MyMemory translation successful: '{text[:50]}...' -> '{translated_text[:50]}...'")
+                    return translated_text.strip()
+            
+            raise TranslationError("MyMemory API returned no translation")
             
         except Exception as e:
-            self.logger.error(f"Error in _safe_extract_translation: {e}")
-            return original_text
+            self.logger.error(f"MyMemory translation error: {e}")
+            raise TranslationError(f"MyMemory translation failed: {e}")
     
-    def _create_fallback_translator(self):
-        """Create a new translator instance as fallback"""
-        try:
-            return Translator(timeout=self.timeout)
-        except Exception as e:
-            self.logger.warning(f"Could not create fallback translator: {e}")
-            return None
-    
-    @log_performance
-    def translate_text(
-        self, 
-        text: str, 
-        source_lang: str = 'auto', 
-        target_lang: str = 'en'
-    ) -> str:
+    def translate_text(self, text: str, source_lang: str = 'auto', target_lang: str = 'en') -> str:
         """
-        Ultra-robust text translation with comprehensive error handling
+        Translate text with multiple fallback methods
         
         Args:
             text: Text to translate
-            source_lang: Source language code (default: 'auto')
-            target_lang: Target language code (default: 'en')
-        
+            source_lang: Source language code (default 'auto')
+            target_lang: Target language code (default 'en')
+            
         Returns:
-            Translated text
+            str: Translated text
         """
         if not text or not text.strip():
             return text
         
-        # Check if text needs translation
-        if not self._is_translatable_text(text):
-            self.logger.debug(f"Skipping non-translatable text: {text[:50]}...")
+        cleaned_text = self._clean_text(text)
+        if not cleaned_text:
             return text
         
-        # Validate languages
-        if not self.language_manager.is_valid_language_code(source_lang) and source_lang != 'auto':
-            self.logger.warning(f"Invalid source language code: {source_lang}, using 'auto'")
-            source_lang = 'auto'
+        self.logger.debug(f"Translating: '{cleaned_text[:100]}...'")
         
-        if not self.language_manager.is_valid_language_code(target_lang):
-            self.logger.warning(f"Invalid target language code: {target_lang}, using 'en'")
-            target_lang = 'en'
+        # Try multiple translation methods
+        translation_methods = [
+            ("Google HTTP", self._translate_via_google_http),
+            ("MyMemory", self._translate_via_mymemory)
+        ]
         
-        # Skip if source and target are the same (and not auto-detect)
-        if source_lang == target_lang and source_lang != 'auto':
-            return text
-        
-        last_exception = None
-        current_translator = self.translator
-        
-        # Try with main translator first, then fallback translator
-        for translator_attempt in range(2):
-            if translator_attempt == 1:
-                self.logger.info("Trying fallback translator...")
-                fallback_translator = self._create_fallback_translator()
-                if fallback_translator:
-                    current_translator = fallback_translator
-                else:
-                    break
-            
-            for attempt in range(self.max_retries + 1):
-                try:
-                    # Add delay between retries (but not on first attempt)
-                    if attempt > 0:
-                        delay = self.retry_delay * (attempt ** 2)  # Exponential backoff
-                        self.logger.debug(f"Waiting {delay:.1f}s before retry {attempt}")
-                        time.sleep(delay)
-                        self.stats['retries_performed'] += 1
-                    
-                    self.logger.debug(f"Translation attempt {attempt + 1}/{self.max_retries + 1} "
-                                    f"(translator {translator_attempt + 1}/2): '{text[:50]}...'")
-                    
-                    # Perform translation
-                    result = current_translator.translate(
-                        text, 
-                        src=source_lang, 
-                        dest=target_lang
-                    )
-                    
-                    # Extract translated text using ultra-robust method
-                    translated_text = self._safe_extract_translation(result, text)
-                    
-                    # Update statistics
-                    self.stats['translations_performed'] += 1
-                    self.stats['characters_translated'] += len(text)
-                    
-                    # Log success
-                    if source_lang == 'auto':
-                        detected_lang = getattr(result, 'src', 'unknown') if hasattr(result, 'src') else 'unknown'
-                        self.logger.debug(f"✅ Translated ({detected_lang}→{target_lang}): '{text[:30]}...' → '{translated_text[:30]}...'")
-                    else:
-                        self.logger.debug(f"✅ Translated ({source_lang}→{target_lang}): '{text[:30]}...' → '{translated_text[:30]}...'")
-                    
-                    return translated_text
-                    
-                except requests.exceptions.ConnectionError as e:
-                    last_exception = f"Network connection failed: {str(e)}"
-                    self.logger.warning(f"Network error on attempt {attempt + 1}: {e}")
-                    
-                except requests.exceptions.Timeout as e:
-                    last_exception = f"Translation request timed out: {str(e)}"
-                    self.logger.warning(f"Timeout error on attempt {attempt + 1}: {e}")
-                    
-                except requests.exceptions.HTTPError as e:
-                    if hasattr(e, 'response') and e.response is not None:
-                        if e.response.status_code == 429:
-                            last_exception = f"Rate limit exceeded: {str(e)}"
-                            self.logger.warning(f"Rate limit error on attempt {attempt + 1}: {e}")
-                            time.sleep(self.retry_delay * 3)  # Longer delay for rate limits
-                        elif e.response.status_code in [401, 403]:
-                            last_exception = f"Authentication failed: {str(e)}"
-                            self.logger.error(f"Auth error on attempt {attempt + 1}: {e}")
-                            break  # Don't retry auth errors
-                        else:
-                            last_exception = f"HTTP error {e.response.status_code}: {str(e)}"
-                            self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
-                    else:
-                        last_exception = f"HTTP error: {str(e)}"
-                        self.logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
-                        
-                except Exception as e:
-                    # Handle any other exception
-                    error_msg = str(e)
-                    last_exception = f"Translation error: {error_msg}"
-                    self.logger.warning(f"Translation error on attempt {attempt + 1} "
-                                      f"(translator {translator_attempt + 1}): {last_exception}")
-                    
-                    # If this is an API format error, no point in retrying with same translator
-                    if "'int' object has no attribute" in error_msg or "has no attribute 'as_dict'" in error_msg:
-                        break  # Try fallback translator instead
-        
-        # All attempts and fallbacks failed - return original text (graceful degradation)
-        self.stats['errors_encountered'] += 1
-        self.logger.warning(f"Translation completely failed, returning original text: '{text[:50]}...'")
-        return text
-    
-    def translate_batch(
-        self, 
-        texts: List[str], 
-        source_lang: str = 'auto', 
-        target_lang: str = 'en',
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """
-        Translate multiple texts with optional parallel processing
-        
-        Args:
-            texts: List of texts to translate
-            source_lang: Source language code
-            target_lang: Target language code
-            progress_callback: Optional callback function for progress updates
-        
-        Returns:
-            List of translated texts
-        """
-        if not texts:
-            return []
-        
-        self.logger.info(f"Starting batch translation of {len(texts)} items ({source_lang}→{target_lang})")
-        
-        if self.parallel_processing and len(texts) > 1:
-            return self._translate_parallel(texts, source_lang, target_lang, progress_callback)
-        else:
-            return self._translate_sequential(texts, source_lang, target_lang, progress_callback)
-    
-    def _translate_sequential(
-        self, 
-        texts: List[str], 
-        source_lang: str, 
-        target_lang: str,
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """Translate texts sequentially"""
-        translated = []
-        total = len(texts)
-        
-        for i, text in enumerate(texts):
+        for method_name, method in translation_methods:
             try:
-                result = self.translate_text(text, source_lang, target_lang)
-                translated.append(result)
+                self.logger.debug(f"Trying {method_name} translation...")
+                result = method(cleaned_text, source_lang, target_lang)
                 
-                if progress_callback:
-                    progress_callback(i + 1, total, f"Translated item {i + 1}/{total}")
+                if result and result.strip() and result != cleaned_text:
+                    self.logger.info(f"Translation successful using {method_name}")
+                    return result
+                else:
+                    self.logger.warning(f"{method_name} returned same text or empty result")
                     
             except Exception as e:
-                self.logger.warning(f"Failed to translate item {i}: {e}")
-                translated.append(text)  # Keep original text on failure
+                self.logger.warning(f"{method_name} failed: {e}")
+                continue
         
-        return translated
+        # If all methods fail, return original text
+        self.logger.error(f"All translation methods failed for: '{cleaned_text[:50]}...'")
+        return text  # Return original text rather than failing
     
-    def _translate_parallel(
-        self, 
-        texts: List[str], 
-        source_lang: str, 
-        target_lang: str,
-        progress_callback: Optional[callable] = None
-    ) -> List[str]:
-        """Translate texts in parallel using ThreadPoolExecutor"""
-        translated = [''] * len(texts)  # Pre-allocate list to maintain order
-        completed = 0
-        total = len(texts)
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all translation tasks
-            future_to_index = {
-                executor.submit(self.translate_text, text, source_lang, target_lang): i
-                for i, text in enumerate(texts)
-            }
-            
-            # Process completed translations
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                try:
-                    result = future.result()
-                    translated[index] = result
-                except Exception as e:
-                    self.logger.warning(f"Failed to translate item {index}: {e}")
-                    translated[index] = texts[index]  # Keep original on failure
-                
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, total, f"Translated item {completed}/{total}")
-        
-        return translated
+    def test_connection(self) -> bool:
+        """Test connection to translation service"""
+        try:
+            test_text = "Hello"
+            result = self.translate_text(test_text, 'en', 'es')
+            return result != test_text  # Should be different if working
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
     
-    def get_supported_languages(self) -> Dict[str, str]:
-        """
-        Get dictionary of supported language codes and names
-        
-        Returns:
-            Dictionary mapping language codes to language names
-        """
-        return self.language_manager.get_all_languages()
-    
-    def detect_language(self, text: str) -> Optional[str]:
-        """
-        Detect the language of given text
-        
-        Args:
-            text: Text to analyze
-        
-        Returns:
-            Detected language code or None if detection fails
-        """
+    def detect_language(self, text: str) -> str:
+        """Detect the language of the given text"""
         if not text or not text.strip():
-            return None
+            return 'unknown'
         
         try:
-            result = self.translator.detect(text)
-            detected_lang = result.lang if hasattr(result, 'lang') else str(result)
-            self.logger.debug(f"Detected language: {detected_lang} for text: '{text[:50]}...'")
-            return detected_lang
+            self._wait_for_rate_limit()
+            
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {
+                'client': 'gtx',
+                'sl': 'auto',
+                'tl': 'en',
+                'dt': 't',
+                'q': text[:100]  # Use first 100 chars for detection
+            }
+            
+            response = self.session.get(url, params=params, timeout=5)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Extract detected language from response
+            if result and len(result) > 2 and result[2]:
+                detected_lang = result[2]
+                self.logger.debug(f"Detected language: {detected_lang}")
+                return detected_lang
+            
+            return 'unknown'
+            
         except Exception as e:
-            self.logger.warning(f"Language detection failed: {e}")
-            return None
-    
-    def get_statistics(self) -> Dict:
-        """Get translation statistics"""
-        return self.stats.copy()
-    
-    def reset_statistics(self) -> None:
-        """Reset translation statistics"""
-        self.stats = {
-            'translations_performed': 0,
-            'characters_translated': 0,
-            'errors_encountered': 0,
-            'retries_performed': 0,
-            'total_time': 0.0
-        }
-        self.logger.info("Translation statistics reset")
+            self.logger.error(f"Language detection failed: {e}")
+            return 'unknown'

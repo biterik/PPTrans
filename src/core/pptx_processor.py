@@ -1,480 +1,408 @@
 """
-PowerPoint PPTX Processor Module
-Handles loading, processing, and saving PowerPoint presentations
+PPTX Processor - Fixed to match GUI workflow and expectations
 """
-
 import os
-import sys
-import shutil
-import requests
-from typing import Dict, List, Optional, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from pptx import Presentation
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Pt
+from pptx.dml.color import RGBColor
+from utils.logger import LoggerMixin
+from utils.exceptions import ValidationError, PPTXProcessingError
 
-# Add parent directory to path for imports
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
 
-try:
-    from utils.logger import get_logger
-    from utils.exceptions import PPTransError
-except ImportError as e:
-    print(f"Import error: {e}")
-    # Fallback logging
-    import logging
-    get_logger = lambda name: logging.getLogger(name)
+class PPTXProcessor(LoggerMixin):
+    """PowerPoint processor that matches GUI expectations"""
     
-    # Fallback exception
-    class PPTransError(Exception):
-        """Custom exception for PPTrans errors."""
-        pass
-
-
-class PPTXProcessor:
-    """
-    Handles PowerPoint presentation processing, text extraction, and modification.
-    """
-    
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize PPTX processor.
-        
-        Args:
-            config (dict, optional): Configuration dictionary
-        """
-        self.config = config or {}
-        self.logger = get_logger(__name__)
+    def __init__(self, advanced_settings: dict):
+        """Initialize with advanced settings from config"""
+        self.settings = advanced_settings
         self.presentation = None
-        self.file_path = None
-        self._current_text_elements = {}
-        self._translations = {}
-        self._stats = {'translated_elements': 0, 'processed_slides': 0}
+        self.current_file = None
+        self.text_elements = []
+        self.translated_elements = []
+        self.processing_stats = {
+            'total_slides': 0,
+            'processed_slides': 0,
+            'text_elements_found': 0,
+            'translated_elements': 0,
+            'skipped_elements': 0,
+            'error_count': 0
+        }
         
-        self.logger.info(f"PPTX Processor initialized with config: {self.config}")
-    
-    def load_presentation(self, file_path: str) -> bool:
-        """
-        Load PowerPoint presentation from file.
+        self.logger.info("PPTXProcessor initialized")
         
-        Args:
-            file_path (str): Path to the PPTX file
+    def load_presentation(self, file_path: str):
+        """Load the PowerPoint presentation - matches GUI call"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"PowerPoint file not found: {file_path}")
             
-        Returns:
-            bool: True if loaded successfully, False otherwise
-            
-        Raises:
-            PPTransError: If file cannot be loaded
-        """
         try:
-            if not os.path.exists(file_path):
-                raise PPTransError(f"File not found: {file_path}")
-            
-            if not file_path.lower().endswith('.pptx'):
-                raise PPTransError(f"Invalid file type. Expected .pptx, got: {file_path}")
-            
-            # Create backup if configured
-            if self.config.get('backup_original', True):
-                backup_path = f"{file_path}.backup"
-                shutil.copy2(file_path, backup_path)
-                self.logger.info(f"Created backup: {backup_path}")
-            
-            # Load presentation
+            self.current_file = file_path
             self.presentation = Presentation(file_path)
-            self.file_path = file_path
-            
-            slide_count = len(self.presentation.slides)
-            self.logger.info(f"Presentation loaded successfully: {slide_count} slides")
-            
-            return True
-            
+            self.processing_stats['total_slides'] = len(self.presentation.slides)
+            self.logger.info(f"Loaded presentation with {self.processing_stats['total_slides']} slides")
         except Exception as e:
-            error_msg = f"Failed to load presentation: {str(e)}"
-            self.logger.error(error_msg)
-            raise PPTransError(error_msg) from e
-    
-    def parse_slide_range(self, slide_range_str: str, total_slides: int) -> List[int]:
-        """
-        Parse slide range string and return list of slide indices (0-based).
-        BULLETPROOF VERSION - handles the '-' error and all edge cases
-        
-        Args:
-            slide_range_str (str): Slide range like "1-5", "all", "3,7,9", etc.
-            total_slides (int): Total number of slides in presentation
-            
-        Returns:
-            list: List of 0-based slide indices (integers)
-        """
-        self.logger.debug(f"parse_slide_range called with: '{slide_range_str}' (type: {type(slide_range_str)}), total_slides: {total_slides}")
-        
-        # Handle None, empty, or "all"
-        if not slide_range_str or str(slide_range_str).strip().lower() == "all":
-            result = list(range(total_slides))
-            self.logger.debug(f"Using all slides: {[i+1 for i in result]}")
-            return result
-        
-        # Convert to string and clean
-        slide_range_str = str(slide_range_str).strip()
-        
-        # Handle the specific cases that cause "invalid literal for int() with base 10: '-'"
-        problematic_inputs = ["-", "--", ",-", "-,", ",", " ", ""]
-        if slide_range_str in problematic_inputs:
-            self.logger.warning(f"Invalid slide range '{slide_range_str}', defaulting to all slides")
-            return list(range(total_slides))
-        
-        slide_indices = []
-        
-        try:
-            # Handle comma-separated ranges/numbers
-            parts = []
-            raw_parts = slide_range_str.split(',')
-            self.logger.debug(f"Raw parts after comma split: {raw_parts}")
-            
-            for part in raw_parts:
-                clean_part = part.strip()
-                if clean_part and clean_part not in ["-", ""]:  # Filter out problematic parts
-                    parts.append(clean_part)
-            
-            self.logger.debug(f"Clean parts: {parts}")
-            
-            if not parts:
-                self.logger.warning("No valid parts found after filtering, defaulting to all slides")
-                return list(range(total_slides))
-            
-            for part in parts:
-                self.logger.debug(f"Processing part: '{part}'")
-                
-                if '-' in part:
-                    # Handle range like "1-5"
-                    # But first check if it's just a standalone dash
-                    if part == "-":
-                        self.logger.warning("Skipping standalone dash")
-                        continue
-                        
-                    dash_parts = part.split('-')
-                    self.logger.debug(f"Dash split parts: {dash_parts}")
-                    
-                    # Filter out empty parts from dash split
-                    range_parts = []
-                    for dp in dash_parts:
-                        clean_dp = dp.strip()
-                        if clean_dp:  # Only add non-empty parts
-                            range_parts.append(clean_dp)
-                    
-                    self.logger.debug(f"Clean range parts: {range_parts}")
-                    
-                    if len(range_parts) == 2:
-                        try:
-                            start_str, end_str = range_parts
-                            self.logger.debug(f"Trying to convert: start_str='{start_str}', end_str='{end_str}'")
-                            
-                            start = int(start_str) - 1  # Convert to 0-based
-                            end = int(end_str) - 1      # Convert to 0-based
-                            
-                            # Validate range
-                            if 0 <= start <= end < total_slides:
-                                range_indices = list(range(start, end + 1))
-                                slide_indices.extend(range_indices)
-                                self.logger.info(f"Added range {start+1}-{end+1}: slides {[i+1 for i in range_indices]}")
-                            else:
-                                self.logger.warning(f"Range {start+1}-{end+1} is invalid for {total_slides} slides, skipping")
-                        except ValueError as ve:
-                            self.logger.warning(f"Could not convert range parts '{start_str}'-'{end_str}' to integers: {ve}")
-                    else:
-                        self.logger.warning(f"Invalid range format '{part}' (expected 2 parts, got {len(range_parts)}), skipping")
-                else:
-                    # Handle single slide number
-                    try:
-                        self.logger.debug(f"Trying to convert single slide: '{part}'")
-                        slide_num = int(part) - 1  # Convert to 0-based
-                        if 0 <= slide_num < total_slides:
-                            slide_indices.append(slide_num)
-                            self.logger.info(f"Added single slide {slide_num + 1}")
-                        else:
-                            self.logger.warning(f"Slide {slide_num + 1} out of range (1-{total_slides}), skipping")
-                    except ValueError as ve:
-                        self.logger.warning(f"Could not convert '{part}' to integer: {ve}")
-        
-        except Exception as e:
-            self.logger.error(f"Unexpected error parsing slide range: {e}")
-            self.logger.warning("Defaulting to all slides due to parsing error")
-            return list(range(total_slides))
-        
-        # If no valid indices found, default to all slides
-        if not slide_indices:
-            self.logger.warning("No valid slide numbers found, defaulting to all slides")
-            return list(range(total_slides))
-        
-        # Remove duplicates and sort
-        result = sorted(list(set(slide_indices)))
-        self.logger.info(f"Final processed slides: {[i+1 for i in result]}")
-        return result
-    
-    def extract_text_elements(self, slide_range_str: str = "all") -> Dict[int, List[Dict[str, Any]]]:
-        """
-        Extract text elements from specified slides and store for translation.
-        
-        Args:
-            slide_range_str (str): Slide range specification
-            
-        Returns:
-            dict: Text elements by slide index
-        """
-        try:
-            if not self.presentation:
-                raise PPTransError("No presentation loaded")
-            
-            total_slides = len(self.presentation.slides)
-            self.logger.info(f"Total slides in presentation: {total_slides}")
-            
-            # Parse slide range - now bulletproof
-            slide_indices = self.parse_slide_range(slide_range_str, total_slides)
-            
-            text_elements = {}
-            
-            for slide_idx in slide_indices:
-                slide = self.presentation.slides[slide_idx]
-                slide_texts = []
-                
-                # Extract text from shapes
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        slide_texts.append({
-                            'text': shape.text,
-                            'shape_id': getattr(shape, 'shape_id', None),
-                            'type': 'shape',
-                            'shape_ref': shape  # Keep reference for later
-                        })
-                    elif hasattr(shape, "text_frame"):
-                        # Handle text frames with paragraphs
-                        for paragraph in shape.text_frame.paragraphs:
-                            para_text = "".join(run.text for run in paragraph.runs)
-                            if para_text.strip():
-                                slide_texts.append({
-                                    'text': para_text,
-                                    'shape_id': getattr(shape, 'shape_id', None),
-                                    'paragraph_id': id(paragraph),
-                                    'type': 'paragraph',
-                                    'shape_ref': shape,  # Keep reference for later
-                                    'paragraph_ref': paragraph  # Keep reference for later
-                                })
-                
-                if slide_texts:
-                    text_elements[slide_idx] = slide_texts
-                    self.logger.info(f"Slide {slide_idx + 1}: Found {len(slide_texts)} text elements")
-                else:
-                    self.logger.warning(f"Slide {slide_idx + 1}: No text elements found")
-            
-            total_texts = sum(len(texts) for texts in text_elements.values())
-            self.logger.info(f"Total text elements extracted: {total_texts}")
-            
-            # Store for later use by translate_text_elements
-            self._current_text_elements = text_elements
-            
-            return text_elements
-            
-        except Exception as e:
-            error_msg = f"Error extracting text elements: {str(e)}"
-            self.logger.error(error_msg)
-            raise PPTransError(error_msg) from e
-    
-    def translate_text_elements(self, progress_callback):
-        """
-        This method is called by GUI with a progress callback function.
-        The callback function does the actual translation work.
-        
-        Args:
-            progress_callback: Function that translates text and updates progress
-        """
-        try:
-            self.logger.info("Starting translation with progress callback...")
-            
-            # Get text elements that were already extracted
-            if not hasattr(self, '_current_text_elements') or not self._current_text_elements:
-                # Extract text elements first
-                self.logger.info("Extracting text elements...")
-                self._current_text_elements = self.extract_text_elements("all")
-            
-            text_elements = self._current_text_elements
-            self.logger.info(f"Processing {len(text_elements)} slides for translation")
-            
-            # Store translations
-            self._translations = {}
-            total_elements = 0
-            
-            for slide_idx, slide_texts in text_elements.items():
-                slide_translations = []
-                
-                for j, text_element in enumerate(slide_texts):
-                    original_text = text_element.get('text', '').strip()
-                    
-                    if original_text:
-                        try:
-                            # Call the progress callback - it handles translation AND progress
-                            translated_text = progress_callback(original_text)
-                            
-                            slide_translations.append({
-                                'original_text': original_text,
-                                'translated_text': translated_text,
-                                'text_element': text_element  # Keep reference
-                            })
-                            
-                            total_elements += 1
-                            self.logger.info(f"Slide {slide_idx+1}, Text {j+1}: '{original_text[:40]}...' -> '{translated_text[:40]}...'")
-                            
-                        except Exception as e:
-                            self.logger.warning(f"Translation failed for '{original_text[:30]}...': {e}")
-                            # Keep original text as fallback
-                            slide_translations.append({
-                                'original_text': original_text,
-                                'translated_text': original_text,
-                                'text_element': text_element
-                            })
-                    else:
-                        # Empty text
-                        slide_translations.append({
-                            'original_text': original_text,
-                            'translated_text': original_text,
-                            'text_element': text_element
-                        })
-                
-                self._translations[slide_idx] = slide_translations
-                self.logger.info(f"Slide {slide_idx + 1}: Processed {len(slide_translations)} text elements")
-            
-            # Update stats
-            self._stats['translated_elements'] = total_elements
-            self._stats['processed_slides'] = len(self._translations)
-            
-            self.logger.info(f"Translation complete: {total_elements} elements in {len(self._translations)} slides")
-            
-        except Exception as e:
-            error_msg = f"Error in translate_text_elements: {str(e)}"
-            self.logger.error(error_msg)
-            raise PPTransError(error_msg) from e
-    
-    def apply_translations(self):
-        """
-        Apply the stored translations back to the presentation.
-        Called by GUI after translate_text_elements completes.
-        """
-        try:
-            if not hasattr(self, '_translations') or not self._translations:
-                raise PPTransError("No translations available. Run translate_text_elements first.")
-            
-            self.logger.info(f"Applying translations to {len(self._translations)} slides...")
-            
-            applied_count = 0
-            for slide_idx, slide_translations in self._translations.items():
-                if slide_idx >= len(self.presentation.slides):
-                    continue
-                    
-                slide = self.presentation.slides[slide_idx]
-                
-                for translation in slide_translations:
-                    translated_text = translation.get('translated_text', '')
-                    text_element = translation.get('text_element', {})
-                    
-                    if translated_text and text_element:
-                        try:
-                            # Apply translation based on element type
-                            if text_element.get('type') == 'shape' and 'shape_ref' in text_element:
-                                shape = text_element['shape_ref']
-                                if hasattr(shape, 'text'):
-                                    shape.text = translated_text
-                                    applied_count += 1
-                                    self.logger.debug(f"Applied to shape in slide {slide_idx+1}")
-                                    
-                            elif text_element.get('type') == 'paragraph' and 'paragraph_ref' in text_element:
-                                paragraph = text_element['paragraph_ref']
-                                if paragraph and hasattr(paragraph, 'clear'):
-                                    paragraph.clear()
-                                    if paragraph.runs:
-                                        paragraph.runs[0].text = translated_text
-                                    else:
-                                        run = paragraph.runs.add()
-                                        run.text = translated_text
-                                    applied_count += 1
-                                    self.logger.debug(f"Applied to paragraph in slide {slide_idx+1}")
-                        except Exception as e:
-                            self.logger.warning(f"Failed to apply translation to slide {slide_idx+1}: {e}")
-                            continue
-            
-            self.logger.info(f"Successfully applied {applied_count} translations to presentation")
-            return True
-            
-        except Exception as e:
-            error_msg = f"Error applying translations: {str(e)}"
-            self.logger.error(error_msg)
-            raise PPTransError(error_msg) from e
-    
-    def save_presentation(self, output_path: Optional[str] = None) -> str:
-        """Save the presentation to file."""
-        try:
-            if not self.presentation:
-                raise PPTransError("No presentation loaded")
-            
-            if not output_path:
-                base, ext = os.path.splitext(self.file_path)
-                output_path = f"{base}_translated{ext}"
-            
-            # Ensure directory exists
-            output_dir = os.path.dirname(output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            
-            self.presentation.save(output_path)
-            self.logger.info(f"Presentation saved: {output_path}")
-            return output_path
-            
-        except Exception as e:
-            error_msg = f"Error saving presentation: {str(e)}"
-            self.logger.error(error_msg)
-            raise PPTransError(error_msg) from e
+            self.logger.error(f"Failed to load presentation: {e}")
+            raise PPTXProcessingError(f"Cannot load PowerPoint file: {e}", file_path=file_path)
     
     def get_presentation_info(self) -> Dict[str, Any]:
-        """Get basic information about the loaded presentation."""
+        """Get presentation information - matches GUI call"""
         if not self.presentation:
-            return {"error": "No presentation loaded"}
+            return {'total_slides': 0}
+        
+        return {
+            'total_slides': len(self.presentation.slides),
+            'file_path': self.current_file
+        }
+    
+    def parse_slide_range(self, slide_range: str) -> List[int]:
+        """Parse slide range specification into list of slide indices"""
+        if not self.presentation:
+            raise PPTXProcessingError("No presentation loaded")
+        
+        total_slides = len(self.presentation.slides)
+        
+        if slide_range.lower() == 'all':
+            return list(range(total_slides))
+        
+        indices = []
+        parts = slide_range.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            if '-' in part:
+                try:
+                    start_str, end_str = part.split('-', 1)
+                    start = int(start_str.strip()) - 1  # Convert to 0-based
+                    end = int(end_str.strip()) - 1      # Convert to 0-based
+                    
+                    # Validate range
+                    start = max(0, min(start, total_slides - 1))
+                    end = max(0, min(end, total_slides - 1))
+                    
+                    if start <= end:
+                        indices.extend(range(start, end + 1))
+                    else:
+                        indices.extend(range(end, start + 1))
+                        
+                except ValueError as e:
+                    self.logger.error(f"Invalid range format: {part}")
+                    continue
+            else:
+                try:
+                    slide_num = int(part) - 1  # Convert to 0-based
+                    if 0 <= slide_num < total_slides:
+                        indices.append(slide_num)
+                except ValueError:
+                    self.logger.error(f"Invalid slide number: {part}")
+                    continue
+        
+        # Remove duplicates and sort
+        indices = sorted(list(set(indices)))
+        self.logger.debug(f"Parsed slide range '{slide_range}' to indices: {indices}")
+        return indices
+    
+    def _extract_run_formatting(self, run) -> Dict[str, Any]:
+        """Extract all formatting information from a text run"""
+        formatting = {}
         
         try:
-            total_slides = len(self.presentation.slides)
-            slide_info = []
-            
-            for i, slide in enumerate(self.presentation.slides):
-                text_count = 0
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text.strip():
-                        text_count += 1
-                    elif hasattr(shape, "text_frame"):
-                        for paragraph in shape.text_frame.paragraphs:
-                            if any(run.text.strip() for run in paragraph.runs):
-                                text_count += 1
+            if hasattr(run, 'font'):
+                font = run.font
                 
-                slide_info.append({
-                    'slide_number': i + 1,
-                    'text_elements': text_count
-                })
-            
-            return {
-                'total_slides': total_slides,
-                'slides': slide_info
-            }
-            
+                # Font name
+                if hasattr(font, 'name') and font.name:
+                    formatting['font_name'] = font.name
+                
+                # Font size
+                if hasattr(font, 'size') and font.size:
+                    formatting['font_size'] = font.size.pt
+                
+                # Bold, italic, underline
+                formatting['bold'] = font.bold if font.bold is not None else False
+                formatting['italic'] = font.italic if font.italic is not None else False
+                formatting['underline'] = font.underline if font.underline is not None else False
+                
+                # Font color
+                try:
+                    if hasattr(font, 'color') and font.color and hasattr(font.color, 'rgb'):
+                        rgb = font.color.rgb
+                        if rgb:
+                            formatting['font_color'] = (rgb.r, rgb.g, rgb.b)
+                except Exception:
+                    pass  # Color extraction can fail
+                    
         except Exception as e:
-            self.logger.error(f"Error getting presentation info: {str(e)}")
-            return {"error": str(e)}
+            self.logger.debug(f"Error extracting run formatting: {e}")
+        
+        return formatting
+    
+    def _extract_paragraph_formatting(self, paragraph) -> Dict[str, Any]:
+        """Extract paragraph-level formatting"""
+        formatting = {}
+        
+        try:
+            # Paragraph alignment
+            if hasattr(paragraph, 'alignment') and paragraph.alignment is not None:
+                alignment_map = {
+                    PP_ALIGN.LEFT: 'left',
+                    PP_ALIGN.CENTER: 'center', 
+                    PP_ALIGN.RIGHT: 'right',
+                    PP_ALIGN.JUSTIFY: 'justify'
+                }
+                formatting['alignment'] = alignment_map.get(paragraph.alignment, 'left')
+            
+            # Space before/after
+            if hasattr(paragraph, 'space_before') and paragraph.space_before:
+                formatting['space_before'] = paragraph.space_before.pt
+                
+            if hasattr(paragraph, 'space_after') and paragraph.space_after:
+                formatting['space_after'] = paragraph.space_after.pt
+                
+        except Exception as e:
+            self.logger.debug(f"Error extracting paragraph formatting: {e}")
+        
+        return formatting
+    
+    def extract_text_elements(self, slide_range: str = "all") -> List[Dict[str, Any]]:
+        """
+        Extract text elements from specified slides - matches GUI call
+        Returns the extracted elements (GUI expects return value)
+        """
+        if not self.presentation:
+            raise ProcessingError("No presentation loaded")
+        
+        slide_indices = self.parse_slide_range(slide_range)
+        self.text_elements = []
+        element_id = 0
+        
+        self.logger.info(f"Extracting text from slides: {[i+1 for i in slide_indices]}")
+        
+        for slide_idx in slide_indices:
+            try:
+                slide = self.presentation.slides[slide_idx]
+                slide_elements = 0
+                
+                for shape_idx, shape in enumerate(slide.shapes):
+                    if hasattr(shape, 'text_frame') and shape.text_frame:
+                        text_frame = shape.text_frame
+                        
+                        for para_idx, paragraph in enumerate(text_frame.paragraphs):
+                            if not paragraph.text.strip():
+                                continue
+                                
+                            paragraph_formatting = self._extract_paragraph_formatting(paragraph)
+                            
+                            # Store each run separately to preserve individual formatting
+                            for run_idx, run in enumerate(paragraph.runs):
+                                if run.text.strip():
+                                    run_formatting = self._extract_run_formatting(run)
+                                    
+                                    element = {
+                                        'id': element_id,
+                                        'slide_index': slide_idx,
+                                        'shape_index': shape_idx,
+                                        'paragraph_index': para_idx,
+                                        'run_index': run_idx,
+                                        'original_text': run.text,
+                                        'translated_text': None,
+                                        'run_formatting': run_formatting,
+                                        'paragraph_formatting': paragraph_formatting,
+                                        # Store references for applying changes
+                                        'shape_ref': shape,
+                                        'paragraph_ref': paragraph,
+                                        'run_ref': run
+                                    }
+                                    
+                                    self.text_elements.append(element)
+                                    element_id += 1
+                                    slide_elements += 1
+                
+                self.processing_stats['processed_slides'] += 1
+                self.logger.debug(f"Slide {slide_idx + 1}: Found {slide_elements} text elements")
+                
+            except Exception as e:
+                self.logger.error(f"Error processing slide {slide_idx + 1}: {e}")
+                self.processing_stats['error_count'] += 1
+        
+        self.processing_stats['text_elements_found'] = len(self.text_elements)
+        self.logger.info(f"Extracted {len(self.text_elements)} text elements from {len(slide_indices)} slides")
+        
+        return self.text_elements  # GUI expects return value
+    
+    def translate_text_elements(self, translate_callback: Callable[[str], str]) -> None:
+        """
+        Translate extracted text elements using the provided callback
+        The callback is expected to do the actual translation
+        This matches the GUI workflow where translate_with_progress does the translation
+        """
+        if not self.text_elements:
+            raise ValidationError("No text elements to translate")
+        
+        self.logger.info(f"Starting translation of {len(self.text_elements)} text elements")
+        
+        translated_count = 0
+        skipped_count = 0
+        error_count = 0
+        
+        for i, element in enumerate(self.text_elements):
+            try:
+                original_text = element['original_text']
+                
+                if not original_text.strip():
+                    skipped_count += 1
+                    continue
+                
+                # Use the provided callback to translate (this is where GUI's translate_with_progress is called)
+                translated_text = translate_callback(original_text)
+                
+                if translated_text and translated_text.strip():
+                    element['translated_text'] = translated_text
+                    translated_count += 1
+                    self.logger.debug(f"Translated element {element['id']}: '{original_text[:30]}...' -> '{translated_text[:30]}...'")
+                else:
+                    element['translated_text'] = original_text  # Keep original if translation failed
+                    skipped_count += 1
+                    self.logger.warning(f"Translation failed for element {element['id']}, keeping original text")
+                
+            except Exception as e:
+                self.logger.error(f"Error translating element {i}: {e}")
+                element['translated_text'] = element['original_text']  # Keep original on error
+                error_count += 1
+        
+        self.processing_stats['translated_elements'] = translated_count
+        self.processing_stats['skipped_elements'] = skipped_count
+        self.processing_stats['error_count'] += error_count
+        
+        self.logger.info(f"Translation completed: {translated_count} translated, {skipped_count} skipped, {error_count} errors")
+    
+    def _apply_run_formatting(self, run, formatting: Dict[str, Any]) -> None:
+        """Apply formatting to a text run"""
+        try:
+            if hasattr(run, 'font'):
+                font = run.font
+                
+                # Apply font name
+                if 'font_name' in formatting and formatting['font_name']:
+                    font.name = formatting['font_name']
+                
+                # Apply font size
+                if 'font_size' in formatting and formatting['font_size']:
+                    font.size = Pt(formatting['font_size'])
+                
+                # Apply bold, italic, underline
+                if 'bold' in formatting:
+                    font.bold = formatting['bold']
+                if 'italic' in formatting:
+                    font.italic = formatting['italic']
+                if 'underline' in formatting:
+                    font.underline = formatting['underline']
+                
+                # Apply font color
+                if 'font_color' in formatting and formatting['font_color']:
+                    r, g, b = formatting['font_color']
+                    font.color.rgb = RGBColor(r, g, b)
+                    
+        except Exception as e:
+            self.logger.debug(f"Error applying run formatting: {e}")
+    
+    def _apply_paragraph_formatting(self, paragraph, formatting: Dict[str, Any]) -> None:
+        """Apply formatting to a paragraph"""
+        try:
+            # Apply alignment
+            if 'alignment' in formatting:
+                alignment_map = {
+                    'left': PP_ALIGN.LEFT,
+                    'center': PP_ALIGN.CENTER,
+                    'right': PP_ALIGN.RIGHT,
+                    'justify': PP_ALIGN.JUSTIFY
+                }
+                if formatting['alignment'] in alignment_map:
+                    paragraph.alignment = alignment_map[formatting['alignment']]
+            
+            # Apply spacing
+            if 'space_before' in formatting:
+                paragraph.space_before = Pt(formatting['space_before'])
+            if 'space_after' in formatting:
+                paragraph.space_after = Pt(formatting['space_after'])
+                
+        except Exception as e:
+            self.logger.debug(f"Error applying paragraph formatting: {e}")
+    
+    def apply_translations(self) -> None:
+        """Apply translated text to the presentation with preserved formatting - matches GUI call"""
+        if not self.text_elements:
+            raise ValidationError("No text elements to apply")
+        
+        self.logger.info("Applying translations to presentation")
+        
+        applied_count = 0
+        error_count = 0
+        
+        for element in self.text_elements:
+            try:
+                if element['translated_text'] is None:
+                    continue
+                
+                # Get the run reference
+                run = element['run_ref']
+                
+                # Apply the translated text
+                run.text = element['translated_text']
+                
+                # Reapply all formatting
+                self._apply_run_formatting(run, element['run_formatting'])
+                self._apply_paragraph_formatting(element['paragraph_ref'], element['paragraph_formatting'])
+                
+                applied_count += 1
+                self.logger.debug(f"Applied translation to element {element['id']}")
+                
+            except Exception as e:
+                self.logger.error(f"Error applying translation to element {element.get('id', 'unknown')}: {e}")
+                error_count += 1
+        
+        self.logger.info(f"Applied {applied_count} translations, {error_count} errors")
+        self.processing_stats['error_count'] += error_count
+    
+    def save_presentation(self) -> str:
+        """Save the modified presentation - matches GUI call (returns path)"""
+        if not self.presentation or not self.current_file:
+            raise ProcessingError("No presentation loaded to save")
+            
+        try:
+            # Create output filename
+            input_path = Path(self.current_file)
+            output_path = input_path.parent / f"{input_path.stem}_translated{input_path.suffix}"
+            
+            self.presentation.save(str(output_path))
+            self.logger.info(f"Presentation saved to: {output_path}")
+            return str(output_path)
+        except Exception as e:
+            self.logger.error(f"Failed to save presentation: {e}")
+            raise PPTXProcessingError(f"Cannot save presentation: {e}", file_path=str(output_path))
     
     def get_processing_stats(self) -> Dict[str, Any]:
-        """
-        Get processing statistics.
-        Called by GUI to show completion message.
-        """
-        return self._stats.copy()
+        """Get processing statistics - matches GUI call"""
+        return self.processing_stats.copy()
     
-    def close(self):
-        """Clean up resources."""
-        self.presentation = None
-        self.file_path = None
-        self._current_text_elements = {}
-        self._translations = {}
-        self.logger.info("PPTX Processor closed")
+    def get_text_elements_preview(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get a preview of text elements for debugging"""
+        preview = []
+        for element in self.text_elements[:limit]:
+            preview.append({
+                'id': element['id'],
+                'slide': element['slide_index'] + 1,
+                'original_text': element['original_text'][:100] + ('...' if len(element['original_text']) > 100 else ''),
+                'translated_text': (element['translated_text'][:100] + ('...' if len(element['translated_text']) > 100 else '')) if element['translated_text'] else None,
+                'formatting': {
+                    'font_name': element['run_formatting'].get('font_name'),
+                    'font_size': element['run_formatting'].get('font_size'),
+                    'alignment': element['paragraph_formatting'].get('alignment')
+                }
+            })
+        return preview
